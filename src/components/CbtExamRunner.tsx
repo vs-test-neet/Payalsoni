@@ -1816,6 +1816,8 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     return `/api/store/test/${encodeURIComponent(safeId)}/paper.html?v=${serverStreamMountNonce}`;
   }, [exactHtmlMode, isSubmitted, useServerHtmlStream, serverStreamFailed, activeRawHtml, testMeta.id, serverStreamMountNonce]);
 
+  const [verifiedStreamUrl, setVerifiedStreamUrl] = useState<string>('');
+
   const triggerLocalHtmlFallback = useCallback(async () => {
     setServerStreamFailed(true);
     try {
@@ -1824,11 +1826,76 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
         setLocalFallbackHtml(bundle.rawHtml);
         return;
       }
+      if (bundle.questions && bundle.questions.length > 0) {
+        setLocalFallbackHtml(buildStandaloneCbtHtmlFromQuestions(testMeta, bundle.questions));
+        return;
+      }
+    } catch {
+      // ignore
+    }
+    if (questions && questions.length > 0) {
+      setLocalFallbackHtml(buildStandaloneCbtHtmlFromQuestions(testMeta, questions));
+      return;
+    }
+    try {
+      const assetRes = await fetch(
+        '/assets/aistudio/Vs_PRAYAS_Minor_Test_06__02_11_2026__NEET_CBT_Test_e42702d3.html'
+      );
+      if (assetRes.ok) {
+        const assetHtml = await assetRes.text();
+        if (assetHtml && assetHtml.trim().length > 100) {
+          setLocalFallbackHtml(assetHtml);
+          return;
+        }
+      }
     } catch {
       // ignore
     }
     setExactHtmlMode(false);
-  }, [testMeta.id]);
+  }, [testMeta, questions]);
+
+  useEffect(() => {
+    if (!serverHtmlPaperUrl || !testMeta.id) {
+      setVerifiedStreamUrl('');
+      return;
+    }
+    let cancelled = false;
+    setVerifiedStreamUrl('');
+    const safeId = testMeta.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+    const candidates = isUsingStaticStore()
+      ? [
+          `/static-store/paper/${encodeURIComponent(safeId)}.html?v=${serverStreamMountNonce}`,
+          `/api/store/test/${encodeURIComponent(safeId)}/paper.html?v=${serverStreamMountNonce}`,
+        ]
+      : [
+          `/api/store/test/${encodeURIComponent(safeId)}/paper.html?v=${serverStreamMountNonce}`,
+          `/static-store/paper/${encodeURIComponent(safeId)}.html?v=${serverStreamMountNonce}`,
+        ];
+
+    void (async () => {
+      for (const url of candidates) {
+        try {
+          const res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+          const ct = (res.headers.get('content-type') || '').toLowerCase();
+          if (res.ok && ct.includes('html')) {
+            if (!cancelled) {
+              setVerifiedStreamUrl(url);
+            }
+            return;
+          }
+        } catch {
+          // try next candidate
+        }
+      }
+      if (!cancelled) {
+        void triggerLocalHtmlFallback();
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [serverHtmlPaperUrl, testMeta.id, serverStreamMountNonce, triggerLocalHtmlFallback]);
 
   // Build full-screen native HTML test document ONLY when not streaming directly from server /paper.html
   // Handles ANY partial, legacy, or full HTML structure safely without blocking alert/open or stale storage.
@@ -2644,8 +2711,8 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
   ]);
 
   if (exactHtmlMode && !isSubmitted && (serverHtmlPaperUrl || effectiveHtmlDoc)) {
-    const activeIframeSrc = serverHtmlPaperUrl || htmlBlobUrl || undefined;
-    const activeIframeSrcDoc = activeIframeSrc ? undefined : effectiveHtmlDoc;
+    const activeIframeSrc = verifiedStreamUrl || htmlBlobUrl || undefined;
+    const activeIframeSrcDoc = activeIframeSrc ? undefined : effectiveHtmlDoc || undefined;
     return (
       <div className="fixed inset-0 z-50 w-full h-dvh flex flex-col bg-[#effaff] overflow-hidden">
         {renderShareScorecardModal()}
@@ -2697,18 +2764,25 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
             </button>
           </div>
         )}
-        <iframe
-          src={activeIframeSrc}
-          srcDoc={activeIframeSrcDoc}
-          onLoad={() => setHtmlBridgeReady(true)}
-          onError={() => {
-            if (serverHtmlPaperUrl) {
-              void triggerLocalHtmlFallback();
-            }
-          }}
-          title={testMeta.title}
-          className="w-full flex-1 h-full border-0 bg-white"
-        />
+        {activeIframeSrc || activeIframeSrcDoc ? (
+          <iframe
+            src={activeIframeSrc}
+            srcDoc={activeIframeSrcDoc}
+            onLoad={() => setHtmlBridgeReady(true)}
+            onError={() => {
+              if (serverHtmlPaperUrl) {
+                void triggerLocalHtmlFallback();
+              }
+            }}
+            title={testMeta.title}
+            className="w-full flex-1 h-full border-0 bg-white"
+          />
+        ) : (
+          <div className="w-full flex-1 flex flex-col items-center justify-center gap-3 bg-[#effaff] text-sky-900">
+            <Loader2 className="w-8 h-8 text-sky-600 animate-spin" />
+            <div className="text-sm font-extrabold">Loading Test Paper...</div>
+          </div>
+        )}
       </div>
     );
   }

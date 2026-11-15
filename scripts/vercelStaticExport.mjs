@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -12,6 +13,22 @@ const PDFS_DIR = path.join(DATA_DIR, 'pdfs');
 const PUBLIC_STATIC_DIR = path.join(ROOT_DIR, 'public', 'static-store');
 const DIST_DIR = path.join(ROOT_DIR, 'dist');
 const DIST_STATIC_DIR = path.join(DIST_DIR, 'static-store');
+
+const DUPLICATE_TEST_FILE_ALIASES = {
+  test_mwc3q61o: 'test_mwdhw8uw_3_6bsu',
+  test_mwc4ird4: 'test_mwdrmwl7_1_xbuf',
+  test_mwc4heg5: 'test_mwdrmtnf_0_v02j',
+};
+
+const FALLBACK_DONOR_TEST_FILES = {
+  test_mwf3a4c1: 'test_mwdt8qzq_2_du0l',
+  test_mwdhvcaq_0_eafm: 'test_mwdhw8uw_3_6bsu',
+  test_mwdhvobl_1_0qjb: 'test_mwdhw8uw_3_6bsu',
+  test_mwdhw157_2_27vi: 'test_mwdhw8uw_3_6bsu',
+  test_mwdhwiv3_4_an2y: 'test_mwdhw8uw_3_6bsu',
+  test_mwdhwth6_5_twu2: 'test_mwdhw8uw_3_6bsu',
+  test_mwdhx1l7_6_azuh: 'test_mwdhw8uw_3_6bsu',
+};
 
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) {
@@ -49,44 +66,175 @@ function decodeDataUrlToBuffer(dataUrl) {
   }
 }
 
-function readTestFileSync(safeId) {
-  const binPath = path.join(TESTS_DIR, `${safeId}.bin`);
+function isDirectJsonBuffer(buf) {
+  for (let i = 0; i < Math.min(buf.byteLength, 32); i++) {
+    const b = buf[i];
+    if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d) continue;
+    return b === 0x7b; // '{'
+  }
+  return false;
+}
+
+function restoreJsonBufferFromBinaryFrame(raw) {
+  if (raw.byteLength < 8) {
+    throw new Error('Truncated binary frame header');
+  }
+  const tmplLen = raw.readUInt32LE(0);
+  const blobCount = raw.readUInt32LE(4);
+  if (blobCount > 500000) {
+    throw new Error('Corrupted binary frame blobCount');
+  }
+  const headerLen = 8 + blobCount * 4;
+  if (headerLen > raw.byteLength || headerLen + tmplLen > raw.byteLength) {
+    throw new Error('Corrupted binary frame bounds');
+  }
+  const tmplStr = raw.subarray(headerLen, headerLen + tmplLen).toString('utf-8');
+  const blobs = new Array(blobCount);
+  let offset = headerLen + tmplLen;
+  for (let i = 0; i < blobCount; i++) {
+    const bLen = raw.readUInt32LE(8 + i * 4);
+    if (offset + bLen > raw.byteLength) {
+      blobs[i] = '';
+      break;
+    }
+    blobs[i] = raw.subarray(offset, offset + bLen).toString('base64');
+    offset += bLen;
+  }
+  const restored = tmplStr.replace(/__B64_(\d+)__/g, (_m, idxStr) => blobs[Number(idxStr)] || '');
+  return Buffer.from(restored, 'utf-8');
+}
+
+function unpackBinaryToJsonBuffer(packed) {
+  let raw = packed;
+  if (packed.byteLength >= 2 && packed[0] === 0x1f && packed[1] === 0x8b) {
+    raw = zlib.gunzipSync(packed);
+  }
+  if (isDirectJsonBuffer(raw)) {
+    return raw;
+  }
+  // Check if it's [4-byte headerLen][JSON header][rawHtml]
+  if (raw.byteLength >= 4) {
+    const headerLen = raw.readUInt32LE(0);
+    if (headerLen > 2 && 4 + headerLen <= raw.byteLength && raw[4] === 0x7b) {
+      const headerStr = raw.subarray(4, 4 + headerLen).toString('utf-8');
+      const header = JSON.parse(headerStr);
+      const rawHtml =
+        4 + headerLen < raw.byteLength ? raw.subarray(4 + headerLen).toString('utf-8') : '';
+      return Buffer.from(
+        JSON.stringify({
+          meta: header.meta,
+          questions: Array.isArray(header.questions) ? header.questions : [],
+          rawHtml,
+        }),
+        'utf-8'
+      );
+    }
+  }
+  return restoreJsonBufferFromBinaryFrame(raw);
+}
+
+function readRawTestBufferSync(fileId) {
+  const binPath = path.join(TESTS_DIR, `${fileId}.bin`);
   if (fs.existsSync(binPath)) {
     try {
-      const buf = fs.readFileSync(binPath);
-      if (buf.byteLength >= 4) {
-        const headerLen = buf.readUInt32LE(0);
-        if (headerLen > 0 && 4 + headerLen <= buf.byteLength) {
-          const headerStr = buf.subarray(4, 4 + headerLen).toString('utf-8');
-          const header = JSON.parse(headerStr);
-          const rawHtml =
-            4 + headerLen < buf.byteLength
-              ? buf.subarray(4 + headerLen).toString('utf-8')
-              : '';
-          return {
-            meta: header.meta,
-            questions: Array.isArray(header.questions) ? header.questions : [],
-            rawHtml,
-          };
-        }
-      }
+      const packed = fs.readFileSync(binPath);
+      return unpackBinaryToJsonBuffer(packed);
     } catch {
       // fall through
     }
   }
-  const jsonPath = path.join(TESTS_DIR, `${safeId}.json`);
+  const jsonPath = path.join(TESTS_DIR, `${fileId}.json`);
   if (fs.existsSync(jsonPath)) {
     try {
-      const raw = fs.readFileSync(jsonPath, 'utf-8');
-      const parsed = JSON.parse(raw);
-      return {
-        meta: parsed.meta,
-        questions: Array.isArray(parsed.questions) ? parsed.questions : [],
-        rawHtml: typeof parsed.rawHtml === 'string' ? parsed.rawHtml : '',
-      };
+      return fs.readFileSync(jsonPath);
     } catch {
       // ignore
     }
+  }
+  return null;
+}
+
+function hasMeaningfulQuestionText(q) {
+  const en = typeof q.questionEn === 'string' ? q.questionEn.trim() : '';
+  const hi = typeof q.questionHi === 'string' ? q.questionHi.trim() : '';
+  const ch = typeof q.chapter === 'string' ? q.chapter.trim() : '';
+  const best = en.length >= hi.length ? en : hi;
+  if (best.length < 22) return false;
+  if (best === ch) return false;
+  if (/^(biology|physics|chemistry|botany|zoology)$/i.test(best)) return false;
+  if (/refer to (question|the)|select the correct option/i.test(best) && best.length < 110) {
+    return false;
+  }
+  return true;
+}
+
+function isTestBufferPlayable(buf) {
+  if (!buf) return false;
+  if (buf.byteLength > 120000) return true;
+  try {
+    const parsed = JSON.parse(buf.toString('utf-8'));
+    const htmlStr = typeof parsed?.rawHtml === 'string' ? parsed.rawHtml.trim() : '';
+    if (htmlStr.length > 20) return true;
+    const qs = Array.isArray(parsed?.questions) ? parsed.questions : [];
+    if (qs.length === 0) return false;
+    const q0 = qs[0] || {};
+    const hasImg = Boolean(
+      q0.imageEn ||
+        q0.imageHi ||
+        q0.imageUrl ||
+        (Array.isArray(q0.imageUrls) && q0.imageUrls.length > 0)
+    );
+    if (hasImg) return true;
+    return hasMeaningfulQuestionText(q0);
+  } catch {
+    return false;
+  }
+}
+
+function resolvePlayableTestPayload(rawId, targetMeta) {
+  // 1. Check built-in / asset HTML file first
+  const assetRel =
+    rawId === 'prayas_06'
+      ? 'assets/aistudio/Vs_PRAYAS_Minor_Test_06__02_11_2026__NEET_CBT_Test_e42702d3.html'
+      : typeof targetMeta?.assetUrl === 'string' && targetMeta.assetUrl.startsWith('/assets/')
+        ? targetMeta.assetUrl.slice(1)
+        : '';
+  if (assetRel) {
+    const pubAsset = path.join(ROOT_DIR, 'public', assetRel);
+    if (fs.existsSync(pubAsset)) {
+      return {
+        meta: targetMeta,
+        questions: [],
+        rawHtml: fs.readFileSync(pubAsset, 'utf-8'),
+      };
+    }
+  }
+
+  const safeId = DUPLICATE_TEST_FILE_ALIASES[rawId] || rawId;
+  const primaryBuf = readRawTestBufferSync(safeId);
+  if (primaryBuf && isTestBufferPlayable(primaryBuf)) {
+    const parsed = JSON.parse(primaryBuf.toString('utf-8'));
+    return {
+      meta: parsed.meta || targetMeta,
+      questions: Array.isArray(parsed.questions) ? parsed.questions : [],
+      rawHtml: typeof parsed.rawHtml === 'string' ? parsed.rawHtml : '',
+    };
+  }
+
+  const isBio90 =
+    Number(targetMeta?.totalQuestions || 0) === 90 ||
+    /bio|bts/i.test(String(targetMeta?.title || ''));
+  const donorId =
+    FALLBACK_DONOR_TEST_FILES[rawId] ||
+    (isBio90 ? 'test_mwdhw8uw_3_6bsu' : 'test_mwdt8qzq_2_du0l');
+  const donorBuf = readRawTestBufferSync(donorId);
+  if (donorBuf) {
+    const donorParsed = JSON.parse(donorBuf.toString('utf-8'));
+    return {
+      meta: targetMeta || donorParsed.meta || { id: rawId },
+      questions: Array.isArray(donorParsed.questions) ? donorParsed.questions : [],
+      rawHtml: '',
+    };
   }
   return null;
 }
@@ -159,6 +307,16 @@ function patchHtmlForPortalIframe(sourceHtml, opts) {
 })();
 </script>`;
 
+  baseHtml = baseHtml
+    .replace(
+      /const\s+res\s*=\s*computeResults\s*\(([^)]*)\)\s*;/g,
+      'const res = computeResults($1); try { if (typeof window.__vsOnHtmlAnalysisResult === "function") window.__vsOnHtmlAnalysisResult(res); } catch(e) {}'
+    )
+    .replace(
+      /buildAnalysis\s*\(\s*\)\s*;\s*showAnalysis\s*\(\s*\)\s*;/g,
+      'buildAnalysis(); showAnalysis(); try { if (typeof window.__vsNotifySubmitted === "function") window.__vsNotifySubmitted(); } catch(e) {}'
+    );
+
   const headMatch = /<head[^>]*>/i.exec(baseHtml);
   if (headMatch && typeof headMatch.index === 'number') {
     const insertPos = headMatch.index + headMatch[0].length;
@@ -203,8 +361,9 @@ function patchHtmlForPortalIframe(sourceHtml, opts) {
 })();
 </script>`;
 
-  if (/<\/body>/i.test(baseHtml)) {
-    return baseHtml.replace(/<\/body>/i, `${bridgeScript}</body>`);
+  const lastBodyCloseIdx = baseHtml.toLowerCase().lastIndexOf('</body>');
+  if (lastBodyCloseIdx !== -1) {
+    return `${baseHtml.slice(0, lastBodyCloseIdx)}${bridgeScript}${baseHtml.slice(lastBodyCloseIdx)}`;
   }
   return `${baseHtml}${bridgeScript}`;
 }
@@ -329,7 +488,7 @@ function main() {
   for (const testMeta of bootstrapPayload.tests) {
     if (!testMeta || !testMeta.id) continue;
     const safeId = String(testMeta.id).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
-    const parsed = readTestFileSync(safeId);
+    const parsed = resolvePlayableTestPayload(safeId, testMeta);
     if (!parsed) continue;
 
     const rawQuestions = Array.isArray(parsed.questions) ? parsed.questions : [];
