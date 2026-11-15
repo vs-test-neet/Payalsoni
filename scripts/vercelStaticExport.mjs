@@ -229,13 +229,13 @@ function buildStandaloneCbtHtmlForStatic(meta, questions) {
 
     const hiImg =
       rawHiImg && rawHiImg.startsWith('data:image/') && rawTestId && (idx > 0 || rawHiImg.length > 120000)
-        ? `/static-store/qimg/${encodeURIComponent(rawTestId)}/${idx}_hi.png`
+        ? `/static-store/qimg/${encodeURIComponent(rawTestId)}/${idx}/hi.png`
         : rawHiImg;
     const enImg =
       rawEnImg && rawEnImg.startsWith('data:image/') && rawTestId && (idx > 0 || rawEnImg.length > 120000)
         ? rawEnImg === rawHiImg
           ? hiImg
-          : `/static-store/qimg/${encodeURIComponent(rawTestId)}/${idx}_en.png`
+          : `/static-store/qimg/${encodeURIComponent(rawTestId)}/${idx}/en.png`
         : rawEnImg;
 
     const optsHiRaw = Array.isArray(q.optionsHi) ? q.optionsHi : [];
@@ -354,13 +354,15 @@ function main() {
           ensureImageDataUrlServer(q.questionEn) ||
           hiDataUrl;
 
+        const qIdxDir = path.join(testQimgDir, String(idx));
+        ensureDir(qIdxDir);
         const hiBuf = decodeDataUrlToBuffer(hiDataUrl);
         if (hiBuf) {
-          fs.writeFileSync(path.join(testQimgDir, `${idx}_hi.png`), hiBuf);
+          fs.writeFileSync(path.join(qIdxDir, 'hi.png'), hiBuf);
         }
         const enBuf = decodeDataUrlToBuffer(enDataUrl);
         if (enBuf) {
-          fs.writeFileSync(path.join(testQimgDir, `${idx}_en.png`), enBuf);
+          fs.writeFileSync(path.join(qIdxDir, 'en.png'), enBuf);
         }
       });
     }
@@ -380,9 +382,9 @@ function main() {
           ensureImageDataUrlServer(imgs[1]) ||
           ensureImageDataUrlServer(q.questionEn)
       );
-      const hiUrl = hasInlineHi ? `/static-store/qimg/${encodeURIComponent(safeId)}/${idx}_hi.png` : '';
+      const hiUrl = hasInlineHi ? `/static-store/qimg/${encodeURIComponent(safeId)}/${idx}/hi.png` : '';
       const enUrl = hasInlineEn
-        ? `/static-store/qimg/${encodeURIComponent(safeId)}/${idx}_en.png`
+        ? `/static-store/qimg/${encodeURIComponent(safeId)}/${idx}/en.png`
         : hiUrl;
       return {
         ...q,

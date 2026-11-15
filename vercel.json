@@ -12,7 +12,7 @@
     },
     {
       "source": "/api/store/test/:testId/qimg/:qIdx/:lang",
-      "destination": "/static-store/qimg/:testId/:qIdx_:lang.png"
+      "destination": "/static-store/qimg/:testId/:qIdx/:lang.png"
     },
     {
       "source": "/api/store/test/:testId",
