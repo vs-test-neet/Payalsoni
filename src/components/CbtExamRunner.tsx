@@ -1837,19 +1837,25 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
       setLocalFallbackHtml(buildStandaloneCbtHtmlFromQuestions(testMeta, questions));
       return;
     }
-    try {
-      const assetRes = await fetch(
-        '/assets/aistudio/Vs_PRAYAS_Minor_Test_06__02_11_2026__NEET_CBT_Test_e42702d3.html'
-      );
-      if (assetRes.ok) {
-        const assetHtml = await assetRes.text();
-        if (assetHtml && assetHtml.trim().length > 100) {
-          setLocalFallbackHtml(assetHtml);
-          return;
+    const isPrayas06 =
+      testMeta.id === 'prayas_06' ||
+      (typeof testMeta.assetUrl === 'string' &&
+        testMeta.assetUrl.includes('Vs_PRAYAS_Minor_Test_06'));
+    if (isPrayas06) {
+      try {
+        const assetRes = await fetch(
+          '/assets/aistudio/Vs_PRAYAS_Minor_Test_06__02_11_2026__NEET_CBT_Test_e42702d3.html'
+        );
+        if (assetRes.ok) {
+          const assetHtml = await assetRes.text();
+          if (assetHtml && assetHtml.trim().length > 100) {
+            setLocalFallbackHtml(assetHtml);
+            return;
+          }
         }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
     }
     setExactHtmlMode(false);
   }, [testMeta, questions]);
@@ -1875,7 +1881,10 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     void (async () => {
       for (const url of candidates) {
         try {
-          const res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+          let res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+          if (res.status === 405) {
+            res = await fetch(url, { method: 'GET', cache: 'no-store' });
+          }
           const ct = (res.headers.get('content-type') || '').toLowerCase();
           if (res.ok && ct.includes('html')) {
             if (!cancelled) {
@@ -1960,7 +1969,11 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
       cbt_start: 1,
       cbt_submitted: 1,
       cbt_timePerQ: 1,
-      cbt_theme: 1
+      cbt_theme: 1,
+      cbt_lang: 1,
+      cbt_mode: 1,
+      cbt_cur: 1,
+      cbt_sec: 1
     };
     var origGetItem = Storage.prototype.getItem;
     var origSetItem = Storage.prototype.setItem;

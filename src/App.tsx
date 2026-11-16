@@ -2457,7 +2457,10 @@ function AppContent() {
     if (localQuestionsCache[test.id] && localQuestionsCache[test.id].length > 0) {
       return localQuestionsCache[test.id].map((q, idx) => normalizeCbtQuestion(q, idx));
     }
-    if (test.id === 'prayas_06' || test.assetUrl) {
+    if (
+      test.id === 'prayas_06' ||
+      (typeof test.assetUrl === 'string' && test.assetUrl.includes('PRAYAS_Minor_Test_06'))
+    ) {
       const qs = await loadBuiltInPrayas06Questions();
       if (qs.length > 0) {
         setLocalQuestionsCache((prev) => ({ ...prev, [test.id]: qs }));
@@ -2501,7 +2504,10 @@ function AppContent() {
     if (localRawHtmlCache[test.id]) {
       return localRawHtmlCache[test.id];
     }
-    if (test.id === 'prayas_06' || test.assetUrl) {
+    if (
+      test.id === 'prayas_06' ||
+      (typeof test.assetUrl === 'string' && test.assetUrl.includes('PRAYAS_Minor_Test_06'))
+    ) {
       const builtInHtml = await loadBuiltInPrayas06Html();
       if (builtInHtml) {
         setLocalRawHtmlCache((prev) => ({ ...prev, [test.id]: builtInHtml }));
@@ -2628,7 +2634,10 @@ function AppContent() {
     setIsLoadingTestQuestions(true);
     try {
       let rawHtml = localRawHtmlCache[test.id] || '';
-      if (test.id === 'prayas_06' || test.assetUrl) {
+      if (
+        test.id === 'prayas_06' ||
+        (typeof test.assetUrl === 'string' && test.assetUrl.includes('PRAYAS_Minor_Test_06'))
+      ) {
         if (!hasPlayableCachedQs) {
           qs = await loadBuiltInPrayas06Questions();
         }
@@ -3423,6 +3432,7 @@ function AppContent() {
           }}
         >
           <CbtExamRunner
+            key={activeRunningTest.meta.id}
             testMeta={activeRunningTest.meta}
             questions={activeRunningTest.questions}
             studentName={currentStudent?.fullName || 'NEET Aspirant'}

@@ -29,6 +29,7 @@ import {
   getVaultTestHtml,
   getVaultTestQuestions,
   markTestDeletedInVault,
+  purgeVaultTestPayloads,
   saveTestToVault,
 } from './utils/permanentTestVault';
 
@@ -1046,6 +1047,24 @@ export async function reconcilePermanentTestsWithServer(
   }
 
   const serverIds = new Set(serverTests.map((t) => t.id));
+  if (serverIds.size > 0) {
+    try {
+      const CLIENT_BUNDLE_REV_KEY = 'vs_client_store_rev';
+      const TARGET_CLIENT_BUNDLE_REV = '20261116_v6';
+      if (localStorage.getItem(CLIENT_BUNDLE_REV_KEY) !== TARGET_CLIENT_BUNDLE_REV) {
+        ramTestBundleCache.clear();
+        const serverIdList = Array.from(serverIds);
+        void purgeVaultTestPayloads(serverIdList).catch(() => {});
+        for (const sid of serverIdList) {
+          localStorage.removeItem(`${LOCAL_QUESTIONS_PREFIX}${sid}`);
+          localStorage.removeItem(`${LOCAL_HTML_PREFIX}${sid}`);
+        }
+        localStorage.setItem(CLIENT_BUNDLE_REV_KEY, TARGET_CLIENT_BUNDLE_REV);
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }
   const mergedMap = new Map<string, CbtTestMeta>();
 
   // Step 1: Seed from localStorage + IndexedDB Vault first

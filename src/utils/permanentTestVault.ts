@@ -303,3 +303,25 @@ export async function getVaultDeletedTestIds(): Promise<Set<string>> {
     }
   });
 }
+
+export async function purgeVaultTestPayloads(testIds: string[]): Promise<void> {
+  const db = await openVaultDb();
+  if (!db || !Array.isArray(testIds) || testIds.length === 0) return;
+
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction([STORE_QUESTIONS, STORE_HTML], 'readwrite');
+      const qStore = tx.objectStore(STORE_QUESTIONS);
+      const hStore = tx.objectStore(STORE_HTML);
+      for (const id of testIds) {
+        if (!id) continue;
+        qStore.delete(id);
+        hStore.delete(id);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}

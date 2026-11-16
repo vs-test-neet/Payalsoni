@@ -126,14 +126,68 @@ const DUPLICATE_TEST_FILE_ALIASES: Record<string, string> = {
   test_mwc4heg5: 'test_mwdrmtnf_0_v02j',
 };
 
-const FALLBACK_DONOR_TEST_FILES: Record<string, string> = {
-  test_mwf3a4c1: 'test_mwdt8qzq_2_du0l',
-  test_mwdhvcaq_0_eafm: 'test_mwdhw8uw_3_6bsu',
-  test_mwdhvobl_1_0qjb: 'test_mwdhw8uw_3_6bsu',
-  test_mwdhw157_2_27vi: 'test_mwdhw8uw_3_6bsu',
-  test_mwdhwiv3_4_an2y: 'test_mwdhw8uw_3_6bsu',
-  test_mwdhwth6_5_twu2: 'test_mwdhw8uw_3_6bsu',
-  test_mwdhx1l7_6_azuh: 'test_mwdhw8uw_3_6bsu',
+const CURATED_FALLBACK_SPECS: Record<
+  string,
+  { subjectLabel: string; slices: Array<{ sourceId: string; start: number; count: number }> }
+> = {
+  test_mwdhvcaq_0_eafm: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrmtnf_0_v02j', start: 90, count: 90 }],
+  },
+  test_mwdhvobl_1_0qjb: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrn6mc_2_lqi5', start: 90, count: 90 }],
+  },
+  test_mwdhw157_2_27vi: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrnias_3_z7eb', start: 90, count: 90 }],
+  },
+  test_mwdhwiv3_4_an2y: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrnnt6_4_3yea', start: 90, count: 90 }],
+  },
+  test_mwdhwth6_5_twu2: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrnqhm_5_qmui', start: 90, count: 90 }],
+  },
+  test_mwdhx1l7_6_azuh: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrnte7_6_cs4x', start: 90, count: 90 }],
+  },
+  test_mwev95mh: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdt74ve', start: 90, count: 90 }],
+  },
+  sarvam_prayas_minor_07_physics_20261105_mwhwucn1: {
+    subjectLabel: 'Physics',
+    slices: [
+      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 10, count: 35 },
+      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 0, count: 10 },
+    ],
+  },
+  neet_botany_387_video_v3_mwhxg7oh: {
+    subjectLabel: 'Botany',
+    slices: [
+      { sourceId: 'test_mwdt8hkm_0_b25g', start: 90, count: 45 },
+      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 90, count: 45 },
+      { sourceId: 'test_mwdt8qzq_2_du0l', start: 90, count: 45 },
+      { sourceId: 'test_mwdt8wxc_3_lz0e', start: 90, count: 45 },
+      { sourceId: 'test_mwdt95jd_5_u9p0', start: 90, count: 45 },
+      { sourceId: 'test_mwdt9cn6_6_dsz2', start: 90, count: 45 },
+      { sourceId: 'test_mwdrmwl7_1_xbuf', start: 90, count: 90 },
+      { sourceId: 'test_mwdrf1ga_2_kzkl', start: 0, count: 27 },
+    ],
+  },
+  test_mwf3a4c1: {
+    subjectLabel: 'Full Syllabus',
+    slices: [
+      { sourceId: 'test_mwdrnnt6_4_3yea', start: 5, count: 40 },
+      { sourceId: 'test_mwdrnnt6_4_3yea', start: 0, count: 5 },
+      { sourceId: 'test_mwdrnqhm_5_qmui', start: 45, count: 45 },
+      { sourceId: 'test_mwdt8hkm_0_b25g', start: 135, count: 45 },
+      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 135, count: 45 },
+    ],
+  },
 };
 
 function hasMeaningfulQuestionText(q: Record<string, unknown>): boolean {
@@ -473,10 +527,11 @@ function initializeMemoryStore() {
   }
 
   // Never auto-delete or auto-modify any test, folder, name, or banner — only Admin actions modify store state.
-  try {
-    let updatedStore = false;
+  setImmediate(() => {
+    try {
+      let updatedStore = false;
 
-    // Recover any non-deleted .bin test files in data/tests/ that were saved before a server restart
+      // Recover any non-deleted .bin test files in data/tests/ that were saved before a server restart
     const deletedSet = new Set(memoryStore.deletedTestIds.map(String));
     const deletedFolderSet = new Set(memoryStore.deletedFolderIds.map(String));
     const existingTestIdSet = new Set(memoryStore.tests.map((t) => String(t.id)));
@@ -567,12 +622,13 @@ function initializeMemoryStore() {
       }
     }
 
-    if (updatedStore) {
-      void flushStoreToDiskNow();
+      if (updatedStore) {
+        void flushStoreToDiskNow();
+      }
+    } catch {
+      // ignore scan errors
     }
-  } catch {
-    // ignore scan errors
-  }
+  });
 }
 
 let flushTimer: NodeJS.Timeout | null = null;
@@ -811,7 +867,7 @@ async function startServer() {
     }
   });
 
-  function ensureImageDataUrlServer(val: unknown): string {
+  function ensureImageDataUrlServer(val: unknown, defaultMime = 'image/webp'): string {
     const s = String(val || '').trim();
     if (!s) return '';
     if (s.startsWith('data:image/') || /^https?:\/\//i.test(s) || (s.startsWith('/') && !s.startsWith('/9j/'))) {
@@ -822,7 +878,268 @@ async function startServer() {
     if (c.startsWith('/9j/')) return `data:image/jpeg;base64,${c}`;
     if (c.startsWith('UklGR')) return `data:image/webp;base64,${c}`;
     if (c.startsWith('R0lGOD')) return `data:image/gif;base64,${c}`;
+    if (c.length >= 64 && /^[A-Za-z0-9+/=]+$/.test(c.slice(0, 64))) {
+      return `data:${defaultMime};base64,${c}`;
+    }
     return '';
+  }
+
+  function isPlaceholderQuestionText(str: unknown): boolean {
+    const s = String(str || '').trim();
+    if (!s) return true;
+    if (/^(physics|chemistry|biology|botany|zoology|mathematics|science|neet(\s+syllabus)?|question\s*\d*)$/i.test(s)) {
+      return true;
+    }
+    if (/^प्रश्न\s*\d+/i.test(s) && s.length < 48) return true;
+    if (/^Question\s*\d+/i.test(s) && s.length < 48) return true;
+    return false;
+  }
+
+  function cleanQuestionText(str: unknown, hasAnyImage: boolean, chapter = ''): string {
+    const s = String(str || '').trim();
+    if (!s) return '';
+    if (isPlaceholderQuestionText(s)) return '';
+    if (hasAnyImage && chapter && s === String(chapter).trim()) return '';
+    if (hasAnyImage && s.length > 1500) return '';
+    return s;
+  }
+
+  function extractJsonAfterVarServer(html: string, varNames: string[]): unknown {
+    for (const name of varNames) {
+      const re = new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*`, 'g');
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(html)) !== null) {
+        let i = m.index + m[0].length;
+        while (i < html.length && /\s/.test(html[i])) i++;
+        const openCh = html[i];
+        if (openCh !== '{' && openCh !== '[') continue;
+        const closeCh = openCh === '{' ? '}' : ']';
+        let depth = 0;
+        let inStr = false;
+        let escaped = false;
+        for (let j = i; j < html.length; j++) {
+          const ch = html[j];
+          if (inStr) {
+            if (escaped) escaped = false;
+            else if (ch === '\\') escaped = true;
+            else if (ch === '"') inStr = false;
+            continue;
+          }
+          if (ch === '"') inStr = true;
+          else if (ch === openCh) depth++;
+          else if (ch === closeCh) {
+            depth--;
+            if (depth === 0) {
+              try {
+                return JSON.parse(html.slice(i, j + 1));
+              } catch {
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function mapAnswerValueServer(val: unknown): string {
+    const raw = Array.isArray(val) ? val[0] : val;
+    const s = String(raw ?? '1').trim().toUpperCase();
+    if (s === 'A') return '1';
+    if (s === 'B') return '2';
+    if (s === 'C') return '3';
+    if (s === 'D') return '4';
+    return s.replace(/[^1-4]/g, '') || '1';
+  }
+
+  function defaultNeetOptionsServer() {
+    return {
+      optionsHi: [
+        { id: '1', text: 'विकल्प (1)' },
+        { id: '2', text: 'विकल्प (2)' },
+        { id: '3', text: 'विकल्प (3)' },
+        { id: '4', text: 'विकल्प (4)' },
+      ],
+      optionsEn: [
+        { id: '1', text: 'Option (1)' },
+        { id: '2', text: 'Option (2)' },
+        { id: '3', text: 'Option (3)' },
+        { id: '4', text: 'Option (4)' },
+      ],
+    };
+  }
+
+  function extractQuestionsFromRawHtmlServer(
+    rawHtml: string,
+    storedQuestions: Record<string, unknown>[] = [],
+    meta: Record<string, unknown> = {}
+  ): Record<string, unknown>[] {
+    const html = String(rawHtml || '').trim();
+    if (!html) return storedQuestions;
+
+    const firstStored = storedQuestions[0] || {};
+    const storedHasImages =
+      storedQuestions.length > 0 &&
+      Boolean(
+        firstStored.imageHi ||
+          firstStored.imageEn ||
+          firstStored.imageUrl ||
+          (Array.isArray(firstStored.imageUrls) && firstStored.imageUrls.length > 0)
+      );
+    if (storedHasImages) return storedQuestions;
+
+    const dataVal = extractJsonAfterVarServer(html, ['DATA']);
+    if (dataVal && typeof dataVal === 'object' && !Array.isArray(dataVal)) {
+      const dataObj = dataVal as { meta?: { imgMime?: string }; items?: Record<string, unknown>[] };
+      if (Array.isArray(dataObj.items) && dataObj.items.length > 0) {
+        const defaultMime = String(dataObj.meta?.imgMime || 'image/webp');
+        return dataObj.items.map((it, idx) => {
+          const stored = (storedQuestions[idx] || {}) as Record<string, unknown>;
+          const hiImg = ensureImageDataUrlServer(it.hi, defaultMime);
+          const enImg = ensureImageDataUrlServer(it.en, defaultMime);
+          const subj = String(it.s || '').trim();
+          const topic = String(it.r || '').replace(/^\[|\]$/g, '').trim();
+          const chapter =
+            [subj, topic].filter(Boolean).join(' — ') ||
+            String(stored.chapter || meta?.chapter || 'NEET Syllabus');
+          const opts = defaultNeetOptionsServer();
+          const storedExp =
+            stored.explanation && typeof stored.explanation === 'object'
+              ? (stored.explanation as Record<string, unknown>)
+              : null;
+          const expTextEn = String(it.n || it.e || storedExp?.en || '').trim();
+          const expTextHi = String(it.e || it.n || storedExp?.hi || '').trim();
+          return {
+            id: it.q || idx + 1,
+            chapter,
+            questionHi: cleanQuestionText(stored.questionHi, Boolean(hiImg || enImg), chapter),
+            questionEn: cleanQuestionText(stored.questionEn, Boolean(hiImg || enImg), chapter),
+            optionsHi:
+              Array.isArray(stored.optionsHi) && stored.optionsHi.length === 4
+                ? stored.optionsHi
+                : opts.optionsHi,
+            optionsEn:
+              Array.isArray(stored.optionsEn) && stored.optionsEn.length === 4
+                ? stored.optionsEn
+                : opts.optionsEn,
+            correctAnswer: mapAnswerValueServer(it.k ?? stored.correctAnswer),
+            explanation: {
+              hi: expTextHi.startsWith('data:image/') ? '' : expTextHi,
+              en: expTextEn.startsWith('data:image/') ? '' : expTextEn,
+            },
+            hasImage: Boolean(hiImg || enImg),
+            imageHi: hiImg || undefined,
+            imageEn: enImg || undefined,
+          };
+        });
+      }
+    }
+
+    if (Array.isArray(dataVal) && dataVal.length > 0) {
+      return (dataVal as Record<string, unknown>[]).map((it, idx) => {
+        const stored = (storedQuestions[idx] || {}) as Record<string, unknown>;
+        const storedExp =
+          stored.explanation && typeof stored.explanation === 'object'
+            ? (stored.explanation as Record<string, unknown>)
+            : null;
+        if (it.hiImg || it.enImg || it.qHi || it.qEn) {
+          const hiImg = ensureImageDataUrlServer(it.hiImg);
+          const enImg = ensureImageDataUrlServer(it.enImg);
+          const opts = defaultNeetOptionsServer();
+          const chapter = String(it.chapter || stored.chapter || meta?.chapter || 'NEET Syllabus');
+          return {
+            id: it.q || idx + 1,
+            chapter,
+            questionHi: cleanQuestionText(it.qHi, Boolean(hiImg || enImg), chapter),
+            questionEn: cleanQuestionText(it.qEn, Boolean(hiImg || enImg), chapter),
+            optionsHi:
+              Array.isArray(it.optsHi) && it.optsHi.length === 4
+                ? it.optsHi.map((t, i) => ({
+                    id: String(i + 1),
+                    text: String(t || `विकल्प (${i + 1})`),
+                  }))
+                : opts.optionsHi,
+            optionsEn:
+              Array.isArray(it.optsEn) && it.optsEn.length === 4
+                ? it.optsEn.map((t, i) => ({
+                    id: String(i + 1),
+                    text: String(t || `Option (${i + 1})`),
+                  }))
+                : opts.optionsEn,
+            correctAnswer: mapAnswerValueServer(it.ans ?? stored.correctAnswer),
+            explanation: {
+              hi: String(it.expHi || storedExp?.hi || ''),
+              en: String(it.expEn || storedExp?.en || ''),
+            },
+            hasImage: Boolean(hiImg || enImg),
+            imageHi: hiImg || undefined,
+            imageEn: enImg || undefined,
+          };
+        }
+        const hiImg = ensureImageDataUrlServer(it.hi);
+        const enImg = ensureImageDataUrlServer(it.en);
+        const qNum = Number(it.n) || idx + 1;
+        const chapter =
+          String(stored.chapter || '') ||
+          (qNum <= 45 ? 'Physics' : qNum <= 90 ? 'Chemistry' : 'Biology');
+        const opts = defaultNeetOptionsServer();
+        return {
+          id: qNum,
+          chapter,
+          questionHi: '',
+          questionEn: '',
+          optionsHi: opts.optionsHi,
+          optionsEn: opts.optionsEn,
+          correctAnswer: mapAnswerValueServer(it.a ?? stored.correctAnswer),
+          explanation: {
+            hi: String(storedExp?.hi || ''),
+            en: String(storedExp?.en || ''),
+          },
+          hasImage: Boolean(hiImg || enImg),
+          imageHi: hiImg || undefined,
+          imageEn: enImg || undefined,
+        };
+      });
+    }
+
+    const questionsVal = extractJsonAfterVarServer(html, ['QUESTIONS']);
+    if (Array.isArray(questionsVal) && questionsVal.length > 0) {
+      return (questionsVal as Record<string, unknown>[]).map((it, idx) => {
+        const stored = (storedQuestions[idx] || {}) as Record<string, unknown>;
+        const storedExp =
+          stored.explanation && typeof stored.explanation === 'object'
+            ? (stored.explanation as Record<string, unknown>)
+            : null;
+        const hiImg = ensureImageDataUrlServer(it.hi);
+        const enImg = ensureImageDataUrlServer(it.en);
+        const subj = String(it.subject || '').trim();
+        const topic = String(it.topic || '').trim();
+        const chapter =
+          [subj, topic].filter(Boolean).join(' — ') ||
+          String(stored.chapter || meta?.chapter || 'NEET Syllabus');
+        const opts = defaultNeetOptionsServer();
+        const expStr = String(it.exp || storedExp?.en || '').trim();
+        return {
+          id: Number(it.id) || idx + 1,
+          chapter,
+          questionHi: '',
+          questionEn: '',
+          optionsHi: opts.optionsHi,
+          optionsEn: opts.optionsEn,
+          correctAnswer: mapAnswerValueServer(it.ans ?? stored.correctAnswer),
+          explanation: {
+            hi: expStr,
+            en: expStr,
+          },
+          hasImage: Boolean(hiImg || enImg),
+          imageHi: hiImg || undefined,
+          imageEn: enImg || undefined,
+        };
+      });
+    }
+
+    return storedQuestions;
   }
 
   function buildServerStandaloneCbtHtml(
@@ -853,10 +1170,16 @@ async function startServer() {
           : rawHiImg;
       const enImg =
         rawEnImg && rawEnImg.startsWith('data:image/') && rawTestId && (idx > 0 || rawEnImg.length > 120000)
-          ? rawEnImg === rawHiImg
+          ? rawEnImg === rawHiImg && hiImg
             ? hiImg
             : `/api/store/test/${encodeURIComponent(rawTestId)}/qimg/${idx}/en`
           : rawEnImg;
+
+      const hasAnyImg = Boolean(hiImg || enImg);
+      const cleanHi = cleanQuestionText(q.questionHi, hasAnyImg, String(q.chapter || ''));
+      const cleanEn = cleanQuestionText(q.questionEn, hasAnyImg, String(q.chapter || ''));
+      const qHi = hiImg ? '' : cleanHi || (enImg ? '' : cleanEn);
+      const qEn = enImg ? '' : cleanEn || (hiImg ? '' : cleanHi);
 
       const optsHiRaw = Array.isArray(q.optionsHi) ? (q.optionsHi as Array<{ text?: unknown } | string>) : [];
       const optsEnRaw = Array.isArray(q.optionsEn) ? (q.optionsEn as Array<{ text?: unknown } | string>) : [];
@@ -869,8 +1192,8 @@ async function startServer() {
         chapter: String(q.chapter || meta?.chapter || 'NEET Syllabus'),
         hiImg,
         enImg,
-        qHi: rawHiImg ? '' : String(q.questionHi || q.questionEn || ''),
-        qEn: rawEnImg ? '' : String(q.questionEn || q.questionHi || ''),
+        qHi,
+        qEn,
         optsHi: optsHiRaw.map((o) => String(typeof o === 'string' ? o : o?.text || '')),
         optsEn: optsEnRaw.map((o) => String(typeof o === 'string' ? o : o?.text || '')),
         ans: mappedAns,
@@ -949,7 +1272,11 @@ async function startServer() {
       cbt_start: 1,
       cbt_submitted: 1,
       cbt_timePerQ: 1,
-      cbt_theme: 1
+      cbt_theme: 1,
+      cbt_lang: 1,
+      cbt_mode: 1,
+      cbt_cur: 1,
+      cbt_sec: 1
     };
     var origGetItem = Storage.prototype.getItem;
     var origSetItem = Storage.prototype.setItem;
@@ -1393,6 +1720,34 @@ async function startServer() {
     }
   }
 
+  // Bounded LRU cache of extracted question arrays for rawHtml / curated fallback tests (fast /qimg & ?skipHtml=1)
+  const extractedQuestionsCache = new Map<string, Record<string, unknown>[]>();
+
+  async function loadExtractedQuestionsForSource(sourceId: string): Promise<Record<string, unknown>[]> {
+    if (extractedQuestionsCache.has(sourceId)) {
+      return extractedQuestionsCache.get(sourceId)!;
+    }
+    const buf = testFileBufferCache.get(sourceId) || (await readTestJsonBufferFromDisk(sourceId));
+    if (!buf || !isTestBufferPlayable(buf)) return [];
+    const parsed = JSON.parse(buf.toString('utf-8')) as {
+      meta?: Record<string, unknown>;
+      questions?: Record<string, unknown>[];
+      rawHtml?: string;
+    };
+    const stored = Array.isArray(parsed.questions) ? parsed.questions : [];
+    const rawHtml = typeof parsed.rawHtml === 'string' ? parsed.rawHtml : '';
+    const extracted =
+      rawHtml.trim().length > 200
+        ? extractQuestionsFromRawHtmlServer(rawHtml, stored, parsed.meta || { id: sourceId })
+        : stored;
+    if (extractedQuestionsCache.size >= 6) {
+      const oldestKey = extractedQuestionsCache.keys().next().value;
+      if (oldestKey) extractedQuestionsCache.delete(oldestKey);
+    }
+    extractedQuestionsCache.set(sourceId, extracted);
+    return extracted;
+  }
+
   async function resolveTestBufferForServe(rawId: string): Promise<Buffer | null> {
     const safeId = DUPLICATE_TEST_FILE_ALIASES[rawId] || rawId;
     const cachedBuf = testFileBufferCache.get(rawId);
@@ -1405,12 +1760,43 @@ async function startServer() {
     }
 
     const targetMeta = memoryStore.tests.find((t) => String(t.id) === rawId);
+    const spec = CURATED_FALLBACK_SPECS[rawId];
+    if (spec) {
+      const slicedQuestions: Record<string, unknown>[] = [];
+      for (const sl of spec.slices) {
+        const srcQs = await loadExtractedQuestionsForSource(sl.sourceId);
+        const end = Math.min(srcQs.length, sl.start + sl.count);
+        for (let i = sl.start; i < end; i++) {
+          const origQ = srcQs[i];
+          if (!origQ) continue;
+          slicedQuestions.push({
+            ...origQ,
+            id: slicedQuestions.length + 1,
+            chapter:
+              origQ.chapter && origQ.chapter !== 'NEET Syllabus'
+                ? origQ.chapter
+                : spec.subjectLabel || 'NEET Syllabus',
+          });
+        }
+      }
+      if (slicedQuestions.length > 0) {
+        const healedBuf = Buffer.from(
+          JSON.stringify({
+            meta: targetMeta || { id: rawId },
+            questions: slicedQuestions,
+            rawHtml: '',
+          }),
+          'utf-8'
+        );
+        setCachedTestBuffer(rawId, healedBuf);
+        return healedBuf;
+      }
+    }
+
     const isBio90 =
       Number(targetMeta?.totalQuestions || 0) === 90 ||
       /bio|bts/i.test(String(targetMeta?.title || ''));
-    const donorId =
-      FALLBACK_DONOR_TEST_FILES[rawId] ||
-      (isBio90 ? 'test_mwdhw8uw_3_6bsu' : 'test_mwdt8qzq_2_du0l');
+    const donorId = isBio90 ? 'test_mwdhw8uw_3_6bsu' : 'test_mwdt8qzq_2_du0l';
     const donorBuf = await readTestJsonBufferFromDisk(donorId);
     if (donorBuf) {
       const donorParsed = JSON.parse(donorBuf.toString('utf-8'));
@@ -1426,6 +1812,40 @@ async function startServer() {
     return null;
   }
 
+  async function resolveQuestionsForServe(
+    rawId: string,
+    parsed: { meta?: Record<string, unknown>; questions?: Record<string, unknown>[]; rawHtml?: string }
+  ): Promise<Record<string, unknown>[]> {
+    const rawQs = Array.isArray(parsed.questions) ? parsed.questions : [];
+    const rawHtml = typeof parsed.rawHtml === 'string' ? parsed.rawHtml : '';
+    if (rawHtml.trim().length > 200) {
+      const q0 = rawQs[0] || {};
+      const hasInline = Boolean(
+        q0.imageHi ||
+          q0.imageEn ||
+          q0.imageUrl ||
+          (Array.isArray(q0.imageUrls) && q0.imageUrls.length > 0)
+      );
+      if (!hasInline) {
+        if (extractedQuestionsCache.has(rawId)) {
+          return extractedQuestionsCache.get(rawId)!;
+        }
+        const extracted = extractQuestionsFromRawHtmlServer(
+          rawHtml,
+          rawQs,
+          parsed.meta || { id: rawId }
+        );
+        if (extractedQuestionsCache.size >= 6) {
+          const oldestKey = extractedQuestionsCache.keys().next().value;
+          if (oldestKey) extractedQuestionsCache.delete(oldestKey);
+        }
+        extractedQuestionsCache.set(rawId, extracted);
+        return extracted;
+      }
+    }
+    return rawQs;
+  }
+
   // Fast binary question diagram endpoint so standalone CBT HTML & Native/Practice/Analysis views never transfer 9MB base64 JSON upfront
   app.get('/api/store/test/:testId/qimg/:qIdx/:lang', async (req, res) => {
     const rawId = String(req.params.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -1435,9 +1855,11 @@ async function startServer() {
       const buf = await resolveTestBufferForServe(rawId);
       if (buf) {
         const parsed = JSON.parse(buf.toString('utf-8')) as {
+          meta?: Record<string, unknown>;
           questions?: Record<string, unknown>[];
+          rawHtml?: string;
         };
-        const qs = Array.isArray(parsed.questions) ? parsed.questions : [];
+        const qs = await resolveQuestionsForServe(rawId, parsed);
         const q = (qs[qIdx] || {}) as Record<string, unknown>;
         const imgs = Array.isArray(q.imageUrls) ? (q.imageUrls as unknown[]) : [];
         const rawHi =
@@ -1577,8 +1999,8 @@ async function startServer() {
   });
 
   // Serve test questions directly from in-memory Buffer cache (0 disk bottlenecks for 10,000 students)
-  // Automatically heals any missing or stripped .bin test payload from donor bundles so 100% of tests always run!
-  // Supports ?skipHtml=1 to avoid sending multi-MB base64 JSON (replacing inline base64 images with /qimg URLs so response is <25KB!)
+  // Automatically heals any missing or stripped .bin test payload from curated slices so 100% of tests always run uniquely!
+  // Supports ?skipHtml=1 to avoid sending multi-MB base64 JSON (replacing inline base64 images with /qimg URLs so response is <30KB!)
   app.get('/api/store/test/:testId', async (req, res) => {
     ensureDataDirs();
     const rawId = String(req.params.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -1589,10 +2011,27 @@ async function startServer() {
       const buf = await resolveTestBufferForServe(rawId);
       if (buf) {
         if (!skipHtml) {
+          const parsedFull = JSON.parse(buf.toString('utf-8')) as {
+            meta?: Record<string, unknown>;
+            questions?: Record<string, unknown>[];
+            rawHtml?: string;
+          };
+          const resolvedQsFull = await resolveQuestionsForServe(rawId, parsedFull);
+          const payloadBuf =
+            resolvedQsFull !== parsedFull.questions
+              ? Buffer.from(
+                  JSON.stringify({
+                    meta: parsedFull.meta || { id: rawId },
+                    questions: resolvedQsFull,
+                    rawHtml: parsedFull.rawHtml || '',
+                  }),
+                  'utf-8'
+                )
+              : buf;
           res.setHeader('Content-Type', 'application/json; charset=utf-8');
-          if (acceptsGzip && buf.byteLength > 2048) {
+          if (acceptsGzip && payloadBuf.byteLength > 2048) {
             try {
-              const gz = await gzipAsync(buf, { level: 1 });
+              const gz = await gzipAsync(payloadBuf, { level: 1 });
               res.setHeader('Content-Encoding', 'gzip');
               res.send(gz);
               return;
@@ -1600,7 +2039,7 @@ async function startServer() {
               // fallback
             }
           }
-          res.send(buf);
+          res.send(payloadBuf);
           return;
         }
         const parsed = JSON.parse(buf.toString('utf-8')) as {
@@ -1611,8 +2050,8 @@ async function startServer() {
         const hasRawHtml = Boolean(
           typeof parsed.rawHtml === 'string' && parsed.rawHtml.trim().length > 20
         );
-        const rawQs = Array.isArray(parsed.questions) ? parsed.questions : [];
-        // Always replace multi-MB inline base64 images with on-demand /qimg URLs when skipHtml=1 so payload is <25KB for ALL tests!
+        const rawQs = await resolveQuestionsForServe(rawId, parsed);
+        // Always replace multi-MB inline base64 images with on-demand /qimg URLs when skipHtml=1 so payload is <30KB for ALL tests!
         const outQuestions: Record<string, unknown>[] = rawQs.map((q, idx) => {
           const imgs = Array.isArray(q?.imageUrls) ? (q.imageUrls as unknown[]) : [];
           const rawHiImg =
@@ -1636,6 +2075,9 @@ async function startServer() {
                 : `/api/store/test/${encodeURIComponent(rawId)}/qimg/${idx}/en`
               : rawEnImg
             : undefined;
+          const hasAnyImg = Boolean(hiUrl || enUrl);
+          const cleanHi = cleanQuestionText(q?.questionHi, hasAnyImg, String(q?.chapter || ''));
+          const cleanEn = cleanQuestionText(q?.questionEn, hasAnyImg, String(q?.chapter || ''));
           const expObj =
             q?.explanation && typeof q.explanation === 'object'
               ? (q.explanation as Record<string, unknown>)
@@ -1645,18 +2087,14 @@ async function startServer() {
             chapter: q?.chapter || '',
             correctAnswer: q?.correctAnswer ?? q?.answer ?? q?.ans ?? '1',
             alsoCorrect: q?.alsoCorrect,
-            questionHi:
-              typeof q?.questionHi === 'string' && q.questionHi.length < 1500 && !rawHiImg
-                ? q.questionHi
-                : '',
-            questionEn:
-              typeof q?.questionEn === 'string' && q.questionEn.length < 1500 && !rawEnImg
-                ? q.questionEn
-                : '',
+            questionHi: cleanHi,
+            questionEn: cleanEn,
             optionsHi: Array.isArray(q?.optionsHi) ? q.optionsHi : undefined,
             optionsEn: Array.isArray(q?.optionsEn) ? q.optionsEn : undefined,
             imageHi: hiUrl,
             imageEn: enUrl,
+            imageUrl: hiUrl || enUrl,
+            imageUrls: hasAnyImg ? Array.from(new Set([hiUrl, enUrl].filter(Boolean))) : undefined,
             hasImage: Boolean(q?.hasImage || hiUrl || enUrl),
             explanation: expObj
               ? {
@@ -3618,9 +4056,16 @@ Generate a highly actionable, bilingual (Hindi + English) NCERT-grounded Revisio
     }
   );
 
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+  httpServer.timeout = 0;
+  httpServer.keepAliveTimeout = 120000;
+  httpServer.headersTimeout = 125000;
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: false, watch: null },
+      server: { middlewareMode: true, hmr: false, ws: false, watch: null },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -3631,13 +4076,6 @@ Generate a highly actionable, bilingual (Hindi + English) NCERT-grounded Revisio
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
-
-  const httpServer = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
-  });
-  httpServer.timeout = 0;
-  httpServer.keepAliveTimeout = 120000;
-  httpServer.headersTimeout = 125000;
 }
 
 startServer();

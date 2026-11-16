@@ -2836,6 +2836,16 @@ export function buildStandaloneCbtHtmlFromQuestions(
   const durMins = Number(meta.durationMinutes) || 90;
   const DURATION = (durMins <= 6 ? durMins * 60 : durMins) * 60;
   const MAX = Number(meta.maxMarks) || N * 4;
+  const isPlaceholderSubjectText = (txt: string): boolean => {
+    const s = String(txt || '').trim();
+    if (!s) return true;
+    if (/^(physics|chemistry|biology|botany|zoology|mathematics|science|neet(\s+syllabus)?|question\s*\d*)$/i.test(s)) {
+      return true;
+    }
+    if (/^प्रश्न\s*\d+/i.test(s) && s.length < 48) return true;
+    if (/^Question\s*\d+/i.test(s) && s.length < 48) return true;
+    return false;
+  };
   const compactQs = questions.map((q, idx) => {
     const hiImg =
       ensureImageDataUrl(q.imageHi || '') ||
@@ -2846,6 +2856,8 @@ export function buildStandaloneCbtHtmlFromQuestions(
       ensureImageDataUrl(q.imageEn || '') ||
       (Array.isArray(q.imageUrls) && q.imageUrls[1] ? ensureImageDataUrl(q.imageUrls[1]) : '') ||
       ensureImageDataUrl(q.questionEn || '');
+    const cleanHi = isPlaceholderSubjectText(q.questionHi || '') ? '' : String(q.questionHi || '').trim();
+    const cleanEn = isPlaceholderSubjectText(q.questionEn || '') ? '' : String(q.questionEn || '').trim();
     const ansNum =
       Number(String(q.correctAnswer || '1').replace(/[^1-4]/g, '')) || 1;
     return {
@@ -2853,8 +2865,8 @@ export function buildStandaloneCbtHtmlFromQuestions(
       chapter: q.chapter || meta.chapter || 'NEET Syllabus',
       hiImg,
       enImg,
-      qHi: hiImg ? '' : String(q.questionHi || ''),
-      qEn: enImg ? '' : String(q.questionEn || ''),
+      qHi: hiImg ? '' : cleanHi || (enImg ? '' : cleanEn),
+      qEn: enImg ? '' : cleanEn || (hiImg ? '' : cleanHi),
       optsHi: Array.isArray(q.optionsHi) ? q.optionsHi.map((o) => String(o?.text || '')) : [],
       optsEn: Array.isArray(q.optionsEn) ? q.optionsEn.map((o) => String(o?.text || '')) : [],
       ans: ansNum,

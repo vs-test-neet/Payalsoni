@@ -20,14 +20,71 @@ const DUPLICATE_TEST_FILE_ALIASES = {
   test_mwc4heg5: 'test_mwdrmtnf_0_v02j',
 };
 
-const FALLBACK_DONOR_TEST_FILES = {
-  test_mwf3a4c1: 'test_mwdt8qzq_2_du0l',
-  test_mwdhvcaq_0_eafm: 'test_mwdhw8uw_3_6bsu',
-  test_mwdhvobl_1_0qjb: 'test_mwdhw8uw_3_6bsu',
-  test_mwdhw157_2_27vi: 'test_mwdhw8uw_3_6bsu',
-  test_mwdhwiv3_4_an2y: 'test_mwdhw8uw_3_6bsu',
-  test_mwdhwth6_5_twu2: 'test_mwdhw8uw_3_6bsu',
-  test_mwdhx1l7_6_azuh: 'test_mwdhw8uw_3_6bsu',
+// Unique, non-overlapping subject-matched slices for tests whose original .bin was missing or a 1KB stub
+const CURATED_FALLBACK_SPECS = {
+  // Bio Booster 01-03, 05-07 (90 Biology Qs each from different FST papers)
+  test_mwdhvcaq_0_eafm: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrmtnf_0_v02j', start: 90, count: 90 }],
+  },
+  test_mwdhvobl_1_0qjb: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrn6mc_2_lqi5', start: 90, count: 90 }],
+  },
+  test_mwdhw157_2_27vi: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrnias_3_z7eb', start: 90, count: 90 }],
+  },
+  test_mwdhwiv3_4_an2y: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrnnt6_4_3yea', start: 90, count: 90 }],
+  },
+  test_mwdhwth6_5_twu2: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrnqhm_5_qmui', start: 90, count: 90 }],
+  },
+  test_mwdhx1l7_6_azuh: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdrnte7_6_cs4x', start: 90, count: 90 }],
+  },
+  // RTS Syllabus & Scheduled (90 Biology Qs from AIATS-01)
+  test_mwev95mh: {
+    subjectLabel: 'Biology',
+    slices: [{ sourceId: 'test_mwdt74ve', start: 90, count: 90 }],
+  },
+  // SARVAM PRAYAS — Minor Test 07 (45 Physics Qs rotated from NRTS-02 so even Q1 is distinct)
+  sarvam_prayas_minor_07_physics_20261105_mwhwucn1: {
+    subjectLabel: 'Physics',
+    slices: [
+      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 10, count: 35 },
+      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 0, count: 10 },
+    ],
+  },
+  // NEET Botany 387 MCQs Diwali (387 Botany/Biology Qs across NRTS-01..07 + FST-02 + PRAYAS-03)
+  neet_botany_387_video_v3_mwhxg7oh: {
+    subjectLabel: 'Botany',
+    slices: [
+      { sourceId: 'test_mwdt8hkm_0_b25g', start: 90, count: 45 },
+      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 90, count: 45 },
+      { sourceId: 'test_mwdt8qzq_2_du0l', start: 90, count: 45 },
+      { sourceId: 'test_mwdt8wxc_3_lz0e', start: 90, count: 45 },
+      { sourceId: 'test_mwdt95jd_5_u9p0', start: 90, count: 45 },
+      { sourceId: 'test_mwdt9cn6_6_dsz2', start: 90, count: 45 },
+      { sourceId: 'test_mwdrmwl7_1_xbuf', start: 90, count: 90 },
+      { sourceId: 'test_mwdrf1ga_2_kzkl', start: 0, count: 27 },
+    ],
+  },
+  // NEET UG 2027 - Sample Paper 2 (180Q: 45 Physics + 45 Chemistry + 90 Zoology)
+  test_mwf3a4c1: {
+    subjectLabel: 'Full Syllabus',
+    slices: [
+      { sourceId: 'test_mwdrnnt6_4_3yea', start: 5, count: 40 },
+      { sourceId: 'test_mwdrnnt6_4_3yea', start: 0, count: 5 },
+      { sourceId: 'test_mwdrnqhm_5_qmui', start: 45, count: 45 },
+      { sourceId: 'test_mwdt8hkm_0_b25g', start: 135, count: 45 },
+      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 135, count: 45 },
+    ],
+  },
 };
 
 function ensureDir(dir) {
@@ -36,7 +93,7 @@ function ensureDir(dir) {
   }
 }
 
-function ensureImageDataUrlServer(val) {
+function ensureImageDataUrlServer(val, defaultMime = 'image/webp') {
   const s = String(val || '').trim();
   if (!s) return '';
   if (
@@ -51,11 +108,34 @@ function ensureImageDataUrlServer(val) {
   if (c.startsWith('/9j/')) return `data:image/jpeg;base64,${c}`;
   if (c.startsWith('UklGR')) return `data:image/webp;base64,${c}`;
   if (c.startsWith('R0lGOD')) return `data:image/gif;base64,${c}`;
+  if (c.length >= 64 && /^[A-Za-z0-9+/=]+$/.test(c.slice(0, 64))) {
+    return `data:${defaultMime};base64,${c}`;
+  }
   return '';
 }
 
+function isPlaceholderQuestionText(str) {
+  const s = String(str || '').trim();
+  if (!s) return true;
+  if (/^(physics|chemistry|biology|botany|zoology|mathematics|science|neet(\s+syllabus)?|question\s*\d*)$/i.test(s)) {
+    return true;
+  }
+  if (/^प्रश्न\s*\d+/i.test(s) && s.length < 48) return true;
+  if (/^Question\s*\d+/i.test(s) && s.length < 48) return true;
+  return false;
+}
+
+function cleanQuestionText(str, hasAnyImage, chapter = '') {
+  const s = String(str || '').trim();
+  if (!s) return '';
+  if (isPlaceholderQuestionText(s)) return '';
+  if (hasAnyImage && chapter && s === String(chapter).trim()) return '';
+  if (hasAnyImage && s.length > 1500) return '';
+  return s;
+}
+
 function decodeDataUrlToBuffer(dataUrl) {
-  if (!dataUrl) return null;
+  if (!dataUrl || !String(dataUrl).startsWith('data:image/')) return null;
   const commaIdx = dataUrl.indexOf(',');
   const b64 = commaIdx !== -1 ? dataUrl.slice(commaIdx + 1) : dataUrl;
   if (!b64 || b64.length < 16) return null;
@@ -70,7 +150,7 @@ function isDirectJsonBuffer(buf) {
   for (let i = 0; i < Math.min(buf.byteLength, 32); i++) {
     const b = buf[i];
     if (b === 0x20 || b === 0x09 || b === 0x0a || b === 0x0d) continue;
-    return b === 0x7b; // '{'
+    return b === 0x7b;
   }
   return false;
 }
@@ -112,7 +192,6 @@ function unpackBinaryToJsonBuffer(packed) {
   if (isDirectJsonBuffer(raw)) {
     return raw;
   }
-  // Check if it's [4-byte headerLen][JSON header][rawHtml]
   if (raw.byteLength >= 4) {
     const headerLen = raw.readUInt32LE(0);
     if (headerLen > 2 && 4 + headerLen <= raw.byteLength && raw[4] === 0x7b) {
@@ -191,8 +270,341 @@ function isTestBufferPlayable(buf) {
   }
 }
 
+function extractJsonAfterVar(html, varNames) {
+  for (const name of varNames) {
+    const re = new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*`, 'g');
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      let i = m.index + m[0].length;
+      while (i < html.length && /\s/.test(html[i])) i++;
+      const openCh = html[i];
+      if (openCh !== '{' && openCh !== '[') continue;
+      const closeCh = openCh === '{' ? '}' : ']';
+      let depth = 0;
+      let inStr = false;
+      let escaped = false;
+      for (let j = i; j < html.length; j++) {
+        const ch = html[j];
+        if (inStr) {
+          if (escaped) {
+            escaped = false;
+          } else if (ch === '\\') {
+            escaped = true;
+          } else if (ch === '"') {
+            inStr = false;
+          }
+          continue;
+        }
+        if (ch === '"') {
+          inStr = true;
+        } else if (ch === openCh) {
+          depth++;
+        } else if (ch === closeCh) {
+          depth--;
+          if (depth === 0) {
+            try {
+              return JSON.parse(html.slice(i, j + 1));
+            } catch {
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function mapAnswerValue(val) {
+  const raw = Array.isArray(val) ? val[0] : val;
+  const s = String(raw ?? '1').trim().toUpperCase();
+  if (s === 'A') return '1';
+  if (s === 'B') return '2';
+  if (s === 'C') return '3';
+  if (s === 'D') return '4';
+  const digits = s.replace(/[^1-4]/g, '');
+  return digits || '1';
+}
+
+function defaultNeetOptions() {
+  return {
+    optionsHi: [
+      { id: '1', text: 'विकल्प (1)' },
+      { id: '2', text: 'विकल्प (2)' },
+      { id: '3', text: 'विकल्प (3)' },
+      { id: '4', text: 'विकल्प (4)' },
+    ],
+    optionsEn: [
+      { id: '1', text: 'Option (1)' },
+      { id: '2', text: 'Option (2)' },
+      { id: '3', text: 'Option (3)' },
+      { id: '4', text: 'Option (4)' },
+    ],
+  };
+}
+
+function extractQuestionsFromRawHtml(rawHtml, storedQuestions = [], meta = {}) {
+  const html = String(rawHtml || '').trim();
+  if (!html) return storedQuestions;
+
+  // Check if storedQuestions already have inline images
+  const storedHasImages =
+    Array.isArray(storedQuestions) &&
+    storedQuestions.length > 0 &&
+    Boolean(
+      storedQuestions[0]?.imageHi ||
+        storedQuestions[0]?.imageEn ||
+        storedQuestions[0]?.imageUrl ||
+        (Array.isArray(storedQuestions[0]?.imageUrls) && storedQuestions[0].imageUrls.length > 0)
+    );
+  if (storedHasImages) return storedQuestions;
+
+  const dataVal = extractJsonAfterVar(html, ['DATA']);
+  if (dataVal && typeof dataVal === 'object' && !Array.isArray(dataVal) && Array.isArray(dataVal.items)) {
+    const defaultMime = String(dataVal.meta?.imgMime || 'image/webp');
+    const items = dataVal.items;
+    return items.map((it, idx) => {
+      const stored = storedQuestions[idx] || {};
+      const hiImg = ensureImageDataUrlServer(it.hi, defaultMime);
+      const enImg = ensureImageDataUrlServer(it.en, defaultMime);
+      const subj = String(it.s || '').trim();
+      const topic = String(it.r || '').replace(/^\[|\]$/g, '').trim();
+      const chapter = [subj, topic].filter(Boolean).join(' — ') || stored.chapter || meta?.chapter || 'NEET Syllabus';
+      const opts = defaultNeetOptions();
+      const expTextEn = String(it.n || it.e || stored?.explanation?.en || '').trim();
+      const expTextHi = String(it.e || it.n || stored?.explanation?.hi || '').trim();
+      return {
+        id: it.q || idx + 1,
+        chapter,
+        questionHi: cleanQuestionText(stored.questionHi, Boolean(hiImg || enImg), chapter),
+        questionEn: cleanQuestionText(stored.questionEn, Boolean(hiImg || enImg), chapter),
+        optionsHi: Array.isArray(stored.optionsHi) && stored.optionsHi.length === 4 ? stored.optionsHi : opts.optionsHi,
+        optionsEn: Array.isArray(stored.optionsEn) && stored.optionsEn.length === 4 ? stored.optionsEn : opts.optionsEn,
+        correctAnswer: mapAnswerValue(it.k ?? stored.correctAnswer),
+        explanation: {
+          hi: expTextHi.startsWith('data:image/') ? '' : expTextHi,
+          en: expTextEn.startsWith('data:image/') ? '' : expTextEn,
+        },
+        hasImage: Boolean(hiImg || enImg),
+        imageHi: hiImg || undefined,
+        imageEn: enImg || undefined,
+      };
+    });
+  }
+
+  if (Array.isArray(dataVal) && dataVal.length > 0) {
+    return dataVal.map((it, idx) => {
+      const stored = storedQuestions[idx] || {};
+      if (it.hiImg || it.enImg || it.qHi || it.qEn) {
+        const hiImg = ensureImageDataUrlServer(it.hiImg);
+        const enImg = ensureImageDataUrlServer(it.enImg);
+        const opts = defaultNeetOptions();
+        return {
+          id: it.q || idx + 1,
+          chapter: String(it.chapter || stored.chapter || meta?.chapter || 'NEET Syllabus'),
+          questionHi: cleanQuestionText(it.qHi, Boolean(hiImg || enImg), it.chapter),
+          questionEn: cleanQuestionText(it.qEn, Boolean(hiImg || enImg), it.chapter),
+          optionsHi: Array.isArray(it.optsHi) && it.optsHi.length === 4
+            ? it.optsHi.map((t, i) => ({ id: String(i + 1), text: String(t || `विकल्प (${i + 1})`) }))
+            : opts.optionsHi,
+          optionsEn: Array.isArray(it.optsEn) && it.optsEn.length === 4
+            ? it.optsEn.map((t, i) => ({ id: String(i + 1), text: String(t || `Option (${i + 1})`) }))
+            : opts.optionsEn,
+          correctAnswer: mapAnswerValue(it.ans ?? stored.correctAnswer),
+          explanation: {
+            hi: String(it.expHi || stored?.explanation?.hi || ''),
+            en: String(it.expEn || stored?.explanation?.en || ''),
+          },
+          hasImage: Boolean(hiImg || enImg),
+          imageHi: hiImg || undefined,
+          imageEn: enImg || undefined,
+        };
+      }
+      const hiImg = ensureImageDataUrlServer(it.hi);
+      const enImg = ensureImageDataUrlServer(it.en);
+      const qNum = Number(it.n) || idx + 1;
+      const chapter =
+        stored.chapter ||
+        (qNum <= 45 ? 'Physics' : qNum <= 90 ? 'Chemistry' : 'Biology');
+      const opts = defaultNeetOptions();
+      return {
+        id: qNum,
+        chapter,
+        questionHi: '',
+        questionEn: '',
+        optionsHi: opts.optionsHi,
+        optionsEn: opts.optionsEn,
+        correctAnswer: mapAnswerValue(it.a ?? stored.correctAnswer),
+        explanation: {
+          hi: String(stored?.explanation?.hi || ''),
+          en: String(stored?.explanation?.en || ''),
+        },
+        hasImage: Boolean(hiImg || enImg),
+        imageHi: hiImg || undefined,
+        imageEn: enImg || undefined,
+      };
+    });
+  }
+
+  const questionsVal = extractJsonAfterVar(html, ['QUESTIONS']);
+  if (Array.isArray(questionsVal) && questionsVal.length > 0) {
+    return questionsVal.map((it, idx) => {
+      const stored = storedQuestions[idx] || {};
+      const hiImg = ensureImageDataUrlServer(it.hi);
+      const enImg = ensureImageDataUrlServer(it.en);
+      const subj = String(it.subject || '').trim();
+      const topic = String(it.topic || '').trim();
+      const chapter = [subj, topic].filter(Boolean).join(' — ') || stored.chapter || meta?.chapter || 'NEET Syllabus';
+      const opts = defaultNeetOptions();
+      const expStr = String(it.exp || stored?.explanation?.en || '').trim();
+      return {
+        id: Number(it.id) || idx + 1,
+        chapter,
+        questionHi: '',
+        questionEn: '',
+        optionsHi: opts.optionsHi,
+        optionsEn: opts.optionsEn,
+        correctAnswer: mapAnswerValue(it.ans ?? stored.correctAnswer),
+        explanation: {
+          hi: expStr,
+          en: expStr,
+        },
+        hasImage: Boolean(hiImg || enImg),
+        imageHi: hiImg || undefined,
+        imageEn: enImg || undefined,
+      };
+    });
+  }
+
+  return storedQuestions;
+}
+
+const resolvedSourceCache = new Map();
+const exportedQimgSources = new Set();
+
+function getResolvedSourceTest(sourceId, targetMeta = null) {
+  if (resolvedSourceCache.has(sourceId)) {
+    return resolvedSourceCache.get(sourceId);
+  }
+  const primaryBuf = readRawTestBufferSync(sourceId);
+  if (!primaryBuf || !isTestBufferPlayable(primaryBuf)) {
+    resolvedSourceCache.set(sourceId, null);
+    return null;
+  }
+  const parsed = JSON.parse(primaryBuf.toString('utf-8'));
+  const rawHtml = typeof parsed.rawHtml === 'string' ? parsed.rawHtml : '';
+  const storedQuestions = Array.isArray(parsed.questions) ? parsed.questions : [];
+  const effMeta = parsed.meta || targetMeta || { id: sourceId };
+  const extractedQuestions =
+    rawHtml.trim().length > 200
+      ? extractQuestionsFromRawHtml(rawHtml, storedQuestions, effMeta)
+      : storedQuestions;
+  const result = {
+    sourceId,
+    meta: effMeta,
+    questions: extractedQuestions,
+    rawHtml,
+  };
+  resolvedSourceCache.set(sourceId, result);
+  return result;
+}
+
+function ensureSourceQimgsExported(sourceTest, distQimgDir) {
+  if (!sourceTest || exportedQimgSources.has(sourceTest.sourceId)) return;
+  exportedQimgSources.add(sourceTest.sourceId);
+
+  const sourceId = sourceTest.sourceId;
+  const testQimgDir = path.join(distQimgDir, sourceId);
+  ensureDir(testQimgDir);
+
+  sourceTest.questions.forEach((q, idx) => {
+    if (!q || typeof q !== 'object') return;
+    const imgs = Array.isArray(q.imageUrls) ? q.imageUrls : [];
+    const hiDataUrl =
+      ensureImageDataUrlServer(q.imageHi) ||
+      ensureImageDataUrlServer(imgs[0]) ||
+      ensureImageDataUrlServer(q.imageUrl) ||
+      ensureImageDataUrlServer(q.questionHi);
+    const enDataUrl =
+      ensureImageDataUrlServer(q.imageEn) ||
+      ensureImageDataUrlServer(imgs[1]) ||
+      ensureImageDataUrlServer(q.questionEn);
+
+    const hiBuf = decodeDataUrlToBuffer(hiDataUrl);
+    const enBuf = decodeDataUrlToBuffer(enDataUrl);
+    if (!hiBuf && !enBuf) return;
+
+    const qIdxDir = path.join(testQimgDir, String(idx));
+    ensureDir(qIdxDir);
+    if (hiBuf) {
+      fs.writeFileSync(path.join(qIdxDir, 'hi.png'), hiBuf);
+    }
+    if (enBuf && (!hiBuf || !enBuf.equals(hiBuf))) {
+      fs.writeFileSync(path.join(qIdxDir, 'en.png'), enBuf);
+    }
+    q._hasHiFile = Boolean(hiBuf);
+    q._hasEnFile = Boolean(enBuf);
+    q._enMatchesHi = Boolean(enBuf && hiBuf && enBuf.equals(hiBuf));
+  });
+}
+
+function buildCompactQuestionWithUrls(q, fallbackSourceId, fallbackIdx) {
+  if (!q || typeof q !== 'object') return q;
+  const imgSourceId = q._srcTestId || fallbackSourceId;
+  const imgIdx = typeof q._srcIdx === 'number' ? q._srcIdx : fallbackIdx;
+
+  const imgs = Array.isArray(q.imageUrls) ? q.imageUrls : [];
+  const rawHi =
+    ensureImageDataUrlServer(q.imageHi) ||
+    ensureImageDataUrlServer(imgs[0]) ||
+    ensureImageDataUrlServer(q.imageUrl) ||
+    ensureImageDataUrlServer(q.questionHi);
+  const rawEn =
+    ensureImageDataUrlServer(q.imageEn) ||
+    ensureImageDataUrlServer(imgs[1]) ||
+    ensureImageDataUrlServer(q.questionEn);
+
+  const hiUrl = rawHi
+    ? rawHi.startsWith('data:image/')
+      ? `/static-store/qimg/${encodeURIComponent(imgSourceId)}/${imgIdx}/hi.png`
+      : rawHi
+    : '';
+  const enUrl = rawEn
+    ? rawEn.startsWith('data:image/')
+      ? rawEn === rawHi && hiUrl
+        ? hiUrl
+        : `/static-store/qimg/${encodeURIComponent(imgSourceId)}/${imgIdx}/en.png`
+      : rawEn
+    : '';
+
+  const hasAnyImg = Boolean(hiUrl || enUrl);
+  const cleanHi = cleanQuestionText(q.questionHi, hasAnyImg, q.chapter);
+  const cleanEn = cleanQuestionText(q.questionEn, hasAnyImg, q.chapter);
+
+  const out = { ...q };
+  delete out._srcTestId;
+  delete out._srcIdx;
+  delete out._hasHiFile;
+  delete out._hasEnFile;
+  delete out._enMatchesHi;
+
+  return {
+    ...out,
+    id: q.id || fallbackIdx + 1,
+    chapter: String(q.chapter || 'NEET Syllabus'),
+    imageUrl: hiUrl || enUrl || undefined,
+    imageHi: hiUrl || undefined,
+    imageEn: enUrl || undefined,
+    imageUrls: hasAnyImg
+      ? Array.from(new Set([hiUrl, enUrl].filter(Boolean)))
+      : undefined,
+    questionHi: cleanHi,
+    questionEn: cleanEn,
+    hasImage: hasAnyImg,
+  };
+}
+
 function resolvePlayableTestPayload(rawId, targetMeta) {
-  // 1. Check built-in / asset HTML file first
   const assetRel =
     rawId === 'prayas_06'
       ? 'assets/aistudio/Vs_PRAYAS_Minor_Test_06__02_11_2026__NEET_CBT_Test_e42702d3.html'
@@ -202,38 +614,83 @@ function resolvePlayableTestPayload(rawId, targetMeta) {
   if (assetRel) {
     const pubAsset = path.join(ROOT_DIR, 'public', assetRel);
     if (fs.existsSync(pubAsset)) {
+      const html = fs.readFileSync(pubAsset, 'utf-8');
       return {
+        sourceId: rawId,
         meta: targetMeta,
-        questions: [],
-        rawHtml: fs.readFileSync(pubAsset, 'utf-8'),
+        questions: extractQuestionsFromRawHtml(html, [], targetMeta),
+        rawHtml: html,
+        usedSources: [],
       };
     }
   }
 
-  const safeId = DUPLICATE_TEST_FILE_ALIASES[rawId] || rawId;
-  const primaryBuf = readRawTestBufferSync(safeId);
-  if (primaryBuf && isTestBufferPlayable(primaryBuf)) {
-    const parsed = JSON.parse(primaryBuf.toString('utf-8'));
+  const primaryId = DUPLICATE_TEST_FILE_ALIASES[rawId] || rawId;
+  const primaryResolved = getResolvedSourceTest(primaryId, targetMeta);
+  if (primaryResolved) {
     return {
-      meta: parsed.meta || targetMeta,
-      questions: Array.isArray(parsed.questions) ? parsed.questions : [],
-      rawHtml: typeof parsed.rawHtml === 'string' ? parsed.rawHtml : '',
+      sourceId: primaryId,
+      meta: targetMeta || primaryResolved.meta,
+      questions: primaryResolved.questions,
+      rawHtml: primaryResolved.rawHtml,
+      usedSources: [primaryResolved],
     };
   }
 
+  const spec = CURATED_FALLBACK_SPECS[rawId];
+  if (spec) {
+    const slicedQuestions = [];
+    const usedSourcesMap = new Map();
+    for (const sl of spec.slices) {
+      const src = getResolvedSourceTest(sl.sourceId);
+      if (!src || !Array.isArray(src.questions)) continue;
+      usedSourcesMap.set(src.sourceId, src);
+      const end = Math.min(src.questions.length, sl.start + sl.count);
+      for (let i = sl.start; i < end; i++) {
+        const origQ = src.questions[i];
+        if (!origQ) continue;
+        slicedQuestions.push({
+          ...origQ,
+          id: slicedQuestions.length + 1,
+          chapter:
+            origQ.chapter && origQ.chapter !== 'NEET Syllabus'
+              ? origQ.chapter
+              : spec.subjectLabel || 'NEET Syllabus',
+          _srcTestId: src.sourceId,
+          _srcIdx: i,
+        });
+      }
+    }
+    if (slicedQuestions.length > 0) {
+      return {
+        sourceId: rawId,
+        meta: targetMeta || { id: rawId },
+        questions: slicedQuestions,
+        rawHtml: '',
+        usedSources: Array.from(usedSourcesMap.values()),
+      };
+    }
+  }
+
+  // Generic final fallback if a brand-new stub ID ever lacks slices
   const isBio90 =
     Number(targetMeta?.totalQuestions || 0) === 90 ||
     /bio|bts/i.test(String(targetMeta?.title || ''));
-  const donorId =
-    FALLBACK_DONOR_TEST_FILES[rawId] ||
-    (isBio90 ? 'test_mwdhw8uw_3_6bsu' : 'test_mwdt8qzq_2_du0l');
-  const donorBuf = readRawTestBufferSync(donorId);
-  if (donorBuf) {
-    const donorParsed = JSON.parse(donorBuf.toString('utf-8'));
+  const fallbackSource = getResolvedSourceTest(
+    isBio90 ? 'test_mwdhw8uw_3_6bsu' : 'test_mwdt8qzq_2_du0l'
+  );
+  if (fallbackSource) {
+    const qs = fallbackSource.questions.map((q, i) => ({
+      ...q,
+      _srcTestId: fallbackSource.sourceId,
+      _srcIdx: i,
+    }));
     return {
-      meta: targetMeta || donorParsed.meta || { id: rawId },
-      questions: Array.isArray(donorParsed.questions) ? donorParsed.questions : [],
+      sourceId: rawId,
+      meta: targetMeta || fallbackSource.meta || { id: rawId },
+      questions: qs,
       rawHtml: '',
+      usedSources: [fallbackSource],
     };
   }
   return null;
@@ -281,7 +738,19 @@ function patchHtmlForPortalIframe(sourceHtml, opts) {
       try { ev.preventDefault(); } catch(e) {}
     });
     var TEST_ISO_ID = ${JSON.stringify(opts.testId || 'default_test')};
-    var GENERIC_CBT_KEYS = { cbt_answers: 1, cbt_marked: 1, cbt_visited: 1, cbt_start: 1, cbt_submitted: 1, cbt_timePerQ: 1, cbt_theme: 1 };
+    var GENERIC_CBT_KEYS = {
+      cbt_answers: 1,
+      cbt_marked: 1,
+      cbt_visited: 1,
+      cbt_start: 1,
+      cbt_submitted: 1,
+      cbt_timePerQ: 1,
+      cbt_theme: 1,
+      cbt_lang: 1,
+      cbt_mode: 1,
+      cbt_cur: 1,
+      cbt_sec: 1
+    };
     var origGetItem = Storage.prototype.getItem;
     var origSetItem = Storage.prototype.setItem;
     var origRemoveItem = Storage.prototype.removeItem;
@@ -303,6 +772,32 @@ function patchHtmlForPortalIframe(sourceHtml, opts) {
         return origRemoveItem.call(this, mapped);
       } catch(e) {}
     };
+    var isoPrefix = 'vs_iso_' + TEST_ISO_ID + '_';
+    var prevSubmitted = origGetItem.call(window.localStorage, isoPrefix + 'cbt_submitted');
+    var prevStart = parseInt(origGetItem.call(window.localStorage, isoPrefix + 'cbt_start') || '0', 10);
+    if (prevSubmitted === 'true' || (prevStart > 0 && (Date.now() - prevStart) > 9000 * 1000)) {
+      origRemoveItem.call(window.localStorage, isoPrefix + 'cbt_submitted');
+      origRemoveItem.call(window.localStorage, isoPrefix + 'cbt_start');
+      origRemoveItem.call(window.localStorage, isoPrefix + 'cbt_answers');
+      origRemoveItem.call(window.localStorage, isoPrefix + 'cbt_marked');
+      origRemoveItem.call(window.localStorage, isoPrefix + 'cbt_visited');
+      origRemoveItem.call(window.localStorage, isoPrefix + 'cbt_timePerQ');
+    }
+    for (var i = window.localStorage.length - 1; i >= 0; i--) {
+      var key = window.localStorage.key(i);
+      if (!key) continue;
+      if (key.indexOf('neet_cbt_') === 0 || key.indexOf('_v4_state') !== -1 || key.indexOf('cbt_state') !== -1) {
+        try {
+          var rawVal = origGetItem.call(window.localStorage, key);
+          if (rawVal && rawVal.charAt(0) === '{') {
+            var parsed = JSON.parse(rawVal);
+            if (parsed && (parsed.submitted === true || (typeof parsed.remainingSec === 'number' && parsed.remainingSec <= 60))) {
+              origRemoveItem.call(window.localStorage, key);
+            }
+          }
+        } catch (err) {}
+      }
+    }
   } catch (e) {}
 })();
 </script>`;
@@ -327,6 +822,17 @@ function patchHtmlForPortalIframe(sourceHtml, opts) {
 
   const bridgeScript = `<script>
 (function(){
+  function fixBase64Img(val) {
+    if (!val || typeof val !== 'string') return val;
+    var s = val.trim();
+    if (s.indexOf('data:image/') === 0 || s.indexOf('http') === 0 || (s.indexOf('/') === 0 && s.indexOf('/9j/') !== 0)) return s;
+    var c = s.replace(/\\s+/g, '');
+    if (c.indexOf('iVBORw0KGgo') === 0) return 'data:image/png;base64,' + c;
+    if (c.indexOf('/9j/') === 0) return 'data:image/jpeg;base64,' + c;
+    if (c.indexOf('UklGR') === 0) return 'data:image/webp;base64,' + c;
+    if (c.indexOf('R0lGOD') === 0) return 'data:image/gif;base64,' + c;
+    return val;
+  }
   function ensureBackButton() {
     try {
       if (document.getElementById('vsPortalBackBtn')) return;
@@ -355,9 +861,264 @@ function patchHtmlForPortalIframe(sourceHtml, opts) {
     ensureBackButton();
     try { window.parent.postMessage({ type: 'VS_CBT_HTML_BRIDGE_READY' }, '*'); } catch(e) {}
   }
-  signalReady();
-  document.addEventListener('DOMContentLoaded', signalReady);
-  window.addEventListener('load', signalReady);
+  try {
+    if (typeof DATA !== 'undefined' && Array.isArray(DATA)) {
+      DATA.forEach(function(it){
+        if (it && it.hi) it.hi = fixBase64Img(it.hi);
+        if (it && it.en) it.en = fixBase64Img(it.en);
+        if (it && it.hiImg) it.hiImg = fixBase64Img(it.hiImg);
+        if (it && it.enImg) it.enImg = fixBase64Img(it.enImg);
+      });
+    }
+    if (typeof PAGES !== 'undefined' && Array.isArray(PAGES)) {
+      for (var p = 0; p < PAGES.length; p++) {
+        PAGES[p] = fixBase64Img(PAGES[p]);
+      }
+    }
+    if (typeof render === 'function') {
+      try { render(); } catch(e) {}
+    }
+    signalReady();
+    document.addEventListener('DOMContentLoaded', signalReady);
+    window.addEventListener('load', signalReady);
+
+    var lastShareStats = null;
+    function injectHtmlShareButton(stats) {
+      if (stats) lastShareStats = stats;
+      setTimeout(function() {
+        var topBtns = document.querySelector('.analysis-top-btns, .analysis-header, .analysis-head');
+        if (topBtns) {
+          if (!document.getElementById('vsShareResultBtn')) {
+            var shareBtn = document.createElement('button');
+            shareBtn.id = 'vsShareResultBtn';
+            shareBtn.type = 'button';
+            shareBtn.className = 'btn';
+            shareBtn.innerHTML = '📤 Share Scorecard';
+            shareBtn.style.cssText = 'background:linear-gradient(135deg,#059669,#0284c7);color:#ffffff;border:none;font-weight:900;padding:8px 14px;border-radius:10px;cursor:pointer;box-shadow:0 4px 12px rgba(2,132,199,0.28);margin-right:6px;';
+            shareBtn.onclick = function(e) {
+              if (e && e.stopPropagation) e.stopPropagation();
+              window.parent.postMessage({ type: 'VS_CBT_HTML_SHARE', stats: lastShareStats }, '*');
+            };
+            topBtns.insertBefore(shareBtn, topBtns.firstChild);
+          }
+          if (!document.getElementById('vsDownloadPdfBtn')) {
+            var pdfBtn = document.createElement('button');
+            pdfBtn.id = 'vsDownloadPdfBtn';
+            pdfBtn.type = 'button';
+            pdfBtn.className = 'btn';
+            pdfBtn.innerHTML = '📥 Download Question PDF (VS)';
+            pdfBtn.style.cssText = 'background:linear-gradient(135deg,#4f46e5,#0284c7);color:#ffffff;border:none;font-weight:900;padding:8px 14px;border-radius:10px;cursor:pointer;box-shadow:0 4px 12px rgba(79,70,229,0.32);margin-right:6px;';
+            pdfBtn.onclick = function(e) {
+              if (e && e.stopPropagation) e.stopPropagation();
+              window.parent.postMessage({ type: 'VS_CBT_HTML_DOWNLOAD_PDF', stats: lastShareStats }, '*');
+            };
+            topBtns.insertBefore(pdfBtn, topBtns.firstChild);
+          }
+        }
+      }, 60);
+    }
+
+    var posted = false;
+    window.__vsOnHtmlAnalysisResult = function(res) {
+      try {
+        if (!res || typeof res !== 'object') return;
+        var items = Array.isArray(res.items) ? res.items : [];
+        var zeroIndexedAnswers = {};
+        var extractedMistakes = [];
+        for (var i = 0; i < items.length; i++) {
+          var it = items[i];
+          if (!it) continue;
+          var qIdx = (typeof it.qNum === 'number' && it.qNum >= 1) ? it.qNum - 1 : i;
+          if (it.userAns !== undefined && it.userAns !== null && String(it.userAns) !== '') {
+            zeroIndexedAnswers[qIdx] = String(it.userAns);
+          }
+          var isWrong = it.status === 'incorrect';
+          var isMarked = Boolean(it.marked);
+          if (isWrong || isMarked) {
+            extractedMistakes.push({
+              qNum: it.qNum || (i + 1),
+              subject: it.subject || '',
+              userAns: it.userAns ? String(it.userAns) : '',
+              corrAns: it.corrAns ? String(it.corrAns) : '1',
+              reason: (isWrong && isMarked) ? 'both' : (isWrong ? 'wrong' : 'bookmarked'),
+              enImg: fixBase64Img(it.enImg || ''),
+              hiImg: fixBase64Img(it.hiImg || ''),
+              seImg: fixBase64Img(it.seImg || ''),
+              shImg: fixBase64Img(it.shImg || ''),
+              expEn: it.expEn || '',
+              ref: it.ref || ''
+            });
+          }
+        }
+        var summaryStats = {
+          score: Number(res.obtained || 0),
+          maxMarks: Number(res.maxMarks || (items.length * 4) || 360),
+          correctCount: Number(res.correct || 0),
+          wrongCount: Number(res.incorrect || 0),
+          unattemptedCount: Number(res.unattempted || 0),
+          accuracy: Math.round(Number(res.accuracy || 0)),
+          totalTimeSpent: Math.max(1, Math.round(Number(res.timeTaken || 60)))
+        };
+        injectHtmlShareButton(summaryStats);
+        if (extractedMistakes.length > 0) {
+          window.parent.postMessage({ type: 'VS_CBT_HTML_MISTAKES', extractedMistakes: extractedMistakes }, '*');
+        }
+        if (!posted) {
+          posted = true;
+          window.parent.postMessage({
+            type: 'VS_CBT_HTML_SUBMIT',
+            score: summaryStats.score,
+            maxMarks: summaryStats.maxMarks,
+            correctCount: summaryStats.correctCount,
+            wrongCount: summaryStats.wrongCount,
+            unattemptedCount: summaryStats.unattemptedCount,
+            accuracy: summaryStats.accuracy,
+            timeTakenSeconds: summaryStats.totalTimeSpent,
+            answers: zeroIndexedAnswers,
+            extractedMistakes: extractedMistakes
+          }, '*');
+        }
+      } catch (err) {}
+    };
+
+    function notifyParentSubmitted() {
+      if (posted) return;
+      posted = true;
+      try {
+        var isAiatsTemplate = (typeof state !== 'undefined' && state && state.answers && typeof questions !== 'undefined' && Array.isArray(questions));
+        var ansMap = isAiatsTemplate
+          ? state.answers
+          : (typeof A !== 'undefined' && A)
+            ? A
+            : (typeof userAnswers !== 'undefined' && userAnswers)
+              ? userAnswers
+              : (typeof answers !== 'undefined' && answers ? answers : {});
+        var qArr = isAiatsTemplate
+          ? questions
+          : (typeof DATA !== 'undefined' && Array.isArray(DATA))
+            ? DATA
+            : (typeof QUESTIONS !== 'undefined' && Array.isArray(QUESTIONS) ? QUESTIONS : null);
+        var totalQ = (typeof N !== 'undefined' && N) ? N : (qArr ? qArr.length : ${opts.totalQuestions || 90});
+        var maxM = (typeof MAX !== 'undefined' && MAX) ? MAX : totalQ * 4;
+        var dur = (typeof DURATION !== 'undefined' && DURATION) ? DURATION : ${opts.durationSeconds || 5400};
+        var rem = (typeof sec !== 'undefined' && typeof sec === 'number')
+          ? sec
+          : (typeof remaining !== 'undefined' && typeof remaining === 'number' ? remaining : 0);
+        var spent = Math.max(1, dur - rem);
+        var correct = 0, wrong = 0, blank = 0;
+        var zeroIndexedAnswers = {};
+        var extractedMistakes = [];
+        for (var i = 0; i < totalQ; i++) {
+          var qObj = qArr && qArr[i] ? qArr[i] : null;
+          var picked = isAiatsTemplate
+            ? (ansMap[i] !== undefined ? Number(ansMap[i]) + 1 : undefined)
+            : (ansMap[i + 1] !== undefined ? ansMap[i + 1] : ansMap[i]);
+          var rightAns = null;
+          if (isAiatsTemplate && qObj && qObj.correct !== undefined) {
+            rightAns = Number(qObj.correct) + 1;
+          } else if (qObj && qObj.ans !== undefined) {
+            rightAns = Array.isArray(qObj.ans) ? qObj.ans[0] : qObj.ans;
+          } else if (typeof ANS !== 'undefined' && Array.isArray(ANS) && ANS[i] !== undefined) {
+            rightAns = ANS[i];
+          } else if (qObj) {
+            rightAns = qObj.correctAnswer || qObj.correctOption || qObj.answer;
+          }
+          if (picked !== undefined && picked !== null && String(picked) !== '') {
+            zeroIndexedAnswers[i] = String(picked);
+            if (rightAns !== null && rightAns !== undefined) {
+              if (String(picked) === String(rightAns)) {
+                correct++;
+              } else {
+                wrong++;
+                extractedMistakes.push({
+                  qNum: i + 1,
+                  subject: (qObj && (qObj.subject || qObj.sub || qObj.sec)) || '',
+                  userAns: String(picked),
+                  corrAns: String(rightAns),
+                  reason: 'wrong',
+                  enImg: fixBase64Img((qObj && (qObj.enImg || qObj.en || qObj.img)) || ''),
+                  hiImg: fixBase64Img((qObj && (qObj.hiImg || qObj.hi)) || ''),
+                  seImg: fixBase64Img((qObj && (qObj.seImg || qObj.solEn)) || ''),
+                  shImg: fixBase64Img((qObj && (qObj.shImg || qObj.solHi)) || ''),
+                  expEn: (qObj && (qObj.expEn || qObj.explanation || qObj.sol || '')) || ''
+                });
+              }
+            } else {
+              correct++;
+            }
+          } else {
+            blank++;
+          }
+        }
+        var score = correct * 4 - wrong;
+        var attempted = correct + wrong;
+        var acc = attempted > 0 ? Math.round((correct / attempted) * 100) : 0;
+        injectHtmlShareButton({
+          score: score,
+          maxMarks: maxM,
+          correctCount: correct,
+          wrongCount: wrong,
+          unattemptedCount: blank,
+          accuracy: acc,
+          totalTimeSpent: spent
+        });
+        window.parent.postMessage({
+          type: 'VS_CBT_HTML_SUBMIT',
+          score: score,
+          maxMarks: maxM,
+          correctCount: correct,
+          wrongCount: wrong,
+          unattemptedCount: blank,
+          accuracy: acc,
+          timeTakenSeconds: spent,
+          answers: zeroIndexedAnswers,
+          extractedMistakes: extractedMistakes
+        }, '*');
+      } catch (err) {}
+    }
+    window.__vsNotifySubmitted = notifyParentSubmitted;
+
+    function postHtmlProgressSnapshot() {
+      if (posted) return;
+      try {
+        var isAiats = (typeof state !== 'undefined' && state && state.answers);
+        var ansMap = isAiats ? state.answers : ((typeof A !== 'undefined' && A) ? A : (typeof userAnswers !== 'undefined' && userAnswers ? userAnswers : {}));
+        var totalQ = (typeof N !== 'undefined' && N) ? N : ${opts.totalQuestions || 90};
+        var rem = (typeof sec !== 'undefined' && typeof sec === 'number') ? sec : (typeof remaining === 'number' ? remaining : ${opts.durationSeconds || 5400});
+        var activeCur = (typeof cur === 'number') ? cur : 0;
+        var zeroIndexed = {};
+        for (var i = 0; i < totalQ; i++) {
+          var picked = isAiats ? (ansMap[i] !== undefined ? Number(ansMap[i]) + 1 : undefined) : (ansMap[i + 1] !== undefined ? ansMap[i + 1] : ansMap[i]);
+          if (picked !== undefined && picked !== null && String(picked) !== '') {
+            zeroIndexed[i] = String(picked);
+          }
+        }
+        window.parent.postMessage({
+          type: 'VS_CBT_HTML_PROGRESS',
+          answers: zeroIndexed,
+          remainingSeconds: rem,
+          currentIdx: activeCur
+        }, '*');
+      } catch (e) {}
+    }
+    setInterval(postHtmlProgressSnapshot, 4000);
+    document.addEventListener('click', function() {
+      setTimeout(postHtmlProgressSnapshot, 120);
+    });
+
+    ['result', 'submit', 'doSubmit', 'buildAnalysis', 'showAnalysis', 'submitExam', 'finishExam', 'showResult', 'calculateScore', 'submitTest'].forEach(function(fnName) {
+      if (typeof window[fnName] === 'function') {
+        var origFn = window[fnName];
+        window[fnName] = function() {
+          var r = origFn.apply(this, arguments);
+          if (fnName !== 'submit') {
+            notifyParentSubmitted();
+          }
+          return r;
+        };
+      }
+    });
+  } catch (e) {}
 })();
 </script>`;
 
@@ -368,13 +1129,15 @@ function patchHtmlForPortalIframe(sourceHtml, opts) {
   return `${baseHtml}${bridgeScript}`;
 }
 
-function buildStandaloneCbtHtmlForStatic(meta, questions) {
-  const rawTestId = String(meta?.id || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+function buildStandaloneCbtHtmlForStatic(meta, questions, defaultSourceId = '') {
+  const rawTestId = String(defaultSourceId || meta?.id || '').replace(/[^a-zA-Z0-9_-]/g, '_');
   const N = questions.length || Number(meta?.totalQuestions) || 90;
   const rawDur = Number(meta?.durationMinutes) || 90;
   const DURATION = (rawDur <= 6 ? rawDur * 60 : Math.max(60, rawDur)) * 60;
   const MAX = Number(meta?.maxMarks) || N * 4;
   const compactQs = questions.map((q, idx) => {
+    const imgSourceId = q._srcTestId || rawTestId;
+    const imgIdx = typeof q._srcIdx === 'number' ? q._srcIdx : idx;
     const imgs = Array.isArray(q.imageUrls) ? q.imageUrls : [];
     const rawHiImg =
       ensureImageDataUrlServer(q.imageHi) ||
@@ -387,15 +1150,21 @@ function buildStandaloneCbtHtmlForStatic(meta, questions) {
       ensureImageDataUrlServer(q.questionEn);
 
     const hiImg =
-      rawHiImg && rawHiImg.startsWith('data:image/') && rawTestId && (idx > 0 || rawHiImg.length > 120000)
-        ? `/static-store/qimg/${encodeURIComponent(rawTestId)}/${idx}/hi.png`
+      rawHiImg && rawHiImg.startsWith('data:image/') && imgSourceId
+        ? `/static-store/qimg/${encodeURIComponent(imgSourceId)}/${imgIdx}/hi.png`
         : rawHiImg;
     const enImg =
-      rawEnImg && rawEnImg.startsWith('data:image/') && rawTestId && (idx > 0 || rawEnImg.length > 120000)
-        ? rawEnImg === rawHiImg
+      rawEnImg && rawEnImg.startsWith('data:image/') && imgSourceId
+        ? rawEnImg === rawHiImg && hiImg
           ? hiImg
-          : `/static-store/qimg/${encodeURIComponent(rawTestId)}/${idx}/en.png`
+          : `/static-store/qimg/${encodeURIComponent(imgSourceId)}/${imgIdx}/en.png`
         : rawEnImg;
+
+    const hasAnyImg = Boolean(hiImg || enImg);
+    const cleanHi = cleanQuestionText(q.questionHi, hasAnyImg, q.chapter);
+    const cleanEn = cleanQuestionText(q.questionEn, hasAnyImg, q.chapter);
+    const qHi = hiImg ? '' : cleanHi || (enImg ? '' : cleanEn);
+    const qEn = enImg ? '' : cleanEn || (hiImg ? '' : cleanHi);
 
     const optsHiRaw = Array.isArray(q.optionsHi) ? q.optionsHi : [];
     const optsEnRaw = Array.isArray(q.optionsEn) ? q.optionsEn : [];
@@ -408,8 +1177,8 @@ function buildStandaloneCbtHtmlForStatic(meta, questions) {
       chapter: String(q.chapter || meta?.chapter || 'NEET Syllabus'),
       hiImg,
       enImg,
-      qHi: rawHiImg ? '' : String(q.questionHi || q.questionEn || ''),
-      qEn: rawEnImg ? '' : String(q.questionEn || q.questionHi || ''),
+      qHi,
+      qEn,
       optsHi: optsHiRaw.map((o) => String(typeof o === 'string' ? o : o?.text || '')),
       optsEn: optsEnRaw.map((o) => String(typeof o === 'string' ? o : o?.text || '')),
       ans: mappedAns,
@@ -450,7 +1219,6 @@ function main() {
 
   const bootstrapJson = JSON.stringify(bootstrapPayload);
 
-  // 1. Always write bootstrap.json to public/static-store and dist/static-store (only ~1.2 MB)
   ensureDir(PUBLIC_STATIC_DIR);
   fs.writeFileSync(path.join(PUBLIC_STATIC_DIR, 'bootstrap.json'), bootstrapJson, 'utf-8');
 
@@ -459,8 +1227,6 @@ function main() {
     fs.writeFileSync(path.join(DIST_STATIC_DIR, 'bootstrap.json'), bootstrapJson, 'utf-8');
   }
 
-  // 2. When building outside AI Studio (e.g. on Vercel, Netlify, Cloudflare, or when EXPORT_STATIC_STORE=1),
-  // export all test JSONs, standalone HTML papers, question diagrams, and PDFs into dist/static-store/!
   const isFullStaticExport =
     !process.env.APPLET_ID ||
     Boolean(process.env.VERCEL) ||
@@ -491,72 +1257,19 @@ function main() {
     const parsed = resolvePlayableTestPayload(safeId, testMeta);
     if (!parsed) continue;
 
+    // Export binary question diagrams once per unique source test
+    for (const src of parsed.usedSources || []) {
+      ensureSourceQimgsExported(src, distQimgDir);
+    }
+
     const rawQuestions = Array.isArray(parsed.questions) ? parsed.questions : [];
     const rawHtml = typeof parsed.rawHtml === 'string' ? parsed.rawHtml : '';
     const hasRawHtml = rawHtml.trim().length > 200;
 
-    // Export binary question diagrams for fast static CDN loading
-    const testQimgDir = path.join(distQimgDir, safeId);
-    if (!hasRawHtml && rawQuestions.length > 0) {
-      ensureDir(testQimgDir);
-      rawQuestions.forEach((q, idx) => {
-        if (!q || typeof q !== 'object') return;
-        const imgs = Array.isArray(q.imageUrls) ? q.imageUrls : [];
-        const hiDataUrl =
-          ensureImageDataUrlServer(q.imageHi) ||
-          ensureImageDataUrlServer(imgs[0]) ||
-          ensureImageDataUrlServer(q.imageUrl) ||
-          ensureImageDataUrlServer(q.questionHi);
-        const enDataUrl =
-          ensureImageDataUrlServer(q.imageEn) ||
-          ensureImageDataUrlServer(imgs[1]) ||
-          ensureImageDataUrlServer(q.questionEn) ||
-          hiDataUrl;
-
-        const qIdxDir = path.join(testQimgDir, String(idx));
-        ensureDir(qIdxDir);
-        const hiBuf = decodeDataUrlToBuffer(hiDataUrl);
-        if (hiBuf) {
-          fs.writeFileSync(path.join(qIdxDir, 'hi.png'), hiBuf);
-        }
-        const enBuf = decodeDataUrlToBuffer(enDataUrl);
-        if (enBuf) {
-          fs.writeFileSync(path.join(qIdxDir, 'en.png'), enBuf);
-        }
-      });
-    }
-
-    // Export compact test metadata + questions JSON (<100KB)
-    const compactQuestions = rawQuestions.map((q, idx) => {
-      if (!q || typeof q !== 'object') return q;
-      const imgs = Array.isArray(q.imageUrls) ? q.imageUrls : [];
-      const hasInlineHi = Boolean(
-        ensureImageDataUrlServer(q.imageHi) ||
-          ensureImageDataUrlServer(imgs[0]) ||
-          ensureImageDataUrlServer(q.imageUrl) ||
-          ensureImageDataUrlServer(q.questionHi)
-      );
-      const hasInlineEn = Boolean(
-        ensureImageDataUrlServer(q.imageEn) ||
-          ensureImageDataUrlServer(imgs[1]) ||
-          ensureImageDataUrlServer(q.questionEn)
-      );
-      const hiUrl = hasInlineHi ? `/static-store/qimg/${encodeURIComponent(safeId)}/${idx}/hi.png` : '';
-      const enUrl = hasInlineEn
-        ? `/static-store/qimg/${encodeURIComponent(safeId)}/${idx}/en.png`
-        : hiUrl;
-      return {
-        ...q,
-        imageUrl: hasRawHtml ? undefined : hiUrl || enUrl || undefined,
-        imageHi: hasRawHtml ? undefined : hiUrl || undefined,
-        imageEn: hasRawHtml ? undefined : enUrl || undefined,
-        imageUrls: hasRawHtml ? undefined : hiUrl ? [hiUrl, enUrl || hiUrl] : undefined,
-        questionHi:
-          typeof q.questionHi === 'string' && q.questionHi.length > 1500 ? '' : q.questionHi,
-        questionEn:
-          typeof q.questionEn === 'string' && q.questionEn.length > 1500 ? '' : q.questionEn,
-      };
-    });
+    // Export compact test metadata + questions JSON with real /static-store/qimg URLs (for Practice, Solutions & PDF)
+    const compactQuestions = rawQuestions.map((q, idx) =>
+      buildCompactQuestionWithUrls(q, parsed.sourceId || safeId, idx)
+    );
 
     fs.writeFileSync(
       path.join(distTestsDir, `${safeId}.json`),
@@ -569,12 +1282,15 @@ function main() {
       'utf-8'
     );
 
-    // Export standalone HTML paper
     const durMin = Number(testMeta.durationMinutes || parsed.meta?.durationMinutes || 180);
     const durSec = (durMin <= 6 ? durMin * 60 : Math.max(60, durMin)) * 60;
     const rawPaper = hasRawHtml
       ? rawHtml
-      : buildStandaloneCbtHtmlForStatic(parsed.meta || testMeta, rawQuestions);
+      : buildStandaloneCbtHtmlForStatic(
+          { ...(parsed.meta || {}), ...testMeta, id: safeId },
+          rawQuestions,
+          parsed.sourceId || safeId
+        );
     const patchedPaper = patchHtmlForPortalIframe(rawPaper, {
       testId: safeId,
       title: String(testMeta.title || parsed.meta?.title || 'VS Test'),
@@ -585,7 +1301,6 @@ function main() {
     exportedCount++;
   }
 
-  // Export PDFs if any exist
   if (fs.existsSync(PDFS_DIR)) {
     for (const file of fs.readdirSync(PDFS_DIR)) {
       if (file.endsWith('.pdf')) {
