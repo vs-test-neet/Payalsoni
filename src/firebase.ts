@@ -5,6 +5,17 @@ import {
   signInWithPopup,
   signOut as fbSignOut,
 } from '@firebase/auth';
+import {
+  getFirestore,
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  getDocFromServer,
+  setDoc,
+  deleteDoc,
+  increment,
+} from '@firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 import {
   CbtQuestion,
@@ -35,7 +46,19 @@ import {
 
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
+export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const googleProvider = new GoogleAuthProvider();
+
+async function testFirestoreConnection() {
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.error('Please check your Firebase configuration.');
+    }
+  }
+}
+void testFirestoreConnection();
 
 export const ADMIN_EMAIL = 'rahulyadav70y@gmail.com';
 export const ADMIN_USERNAME = 'vsrahul73';
@@ -49,7 +72,7 @@ export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
   path: string | null
-): void {
+): never {
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -69,7 +92,8 @@ export function handleFirestoreError(
     operationType,
     path,
   };
-  console.warn('Database sync notice:', JSON.stringify(errInfo));
+  console.error('Firestore Error:', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
 }
 
 export async function signInWithGoogle() {
@@ -88,6 +112,108 @@ export function isUsingStaticStore(): boolean {
 }
 
 const sessionDeletedTestIds = new Set<string>();
+const textEncoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+
+function utf8ByteLength(s: string): number {
+  if (!textEncoder) return s.length * 2;
+  return textEncoder.encode(s).byteLength;
+}
+
+function sliceStringForFirestoreChunks(str: string, maxUtf8Bytes = 680000): string[] {
+  const chunks: string[] = [];
+  let pos = 0;
+  while (pos < str.length) {
+    let len = Math.min(str.length - pos, 680000);
+    let candidate = str.slice(pos, pos + len);
+    while (utf8ByteLength(candidate) > maxUtf8Bytes && len > 1000) {
+      len = Math.floor(len * 0.7);
+      candidate = str.slice(pos, pos + len);
+    }
+    chunks.push(candidate);
+    pos += candidate.length;
+  }
+  return chunks.length > 0 ? chunks : [''];
+}
+
+function stripUndefined<T extends Record<string, unknown>>(obj: T): T {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v !== undefined) out[k] = v;
+  }
+  return out as T;
+}
+
+function buildFirestoreFolderDoc(folder: TestFolder): Record<string, unknown> {
+  const safeId = (folder.id || `folder_${Date.now().toString(36)}`)
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 120);
+  const docObj: Record<string, unknown> = {
+    id: safeId,
+    name: (folder.name || 'General Folder').trim().slice(0, 190) || 'General Folder',
+    description: (folder.description || '').trim().slice(0, 480),
+    createdAt: Number(folder.createdAt) || Date.now(),
+    updatedAt: Date.now(),
+  };
+  if (folder.subject) docObj.subject = String(folder.subject).trim().slice(0, 120);
+  if (folder.bannerUrl !== undefined) {
+    const b = folder.bannerUrl ? String(folder.bannerUrl) : '';
+    if (b.length <= 700000) docObj.bannerUrl = b;
+  }
+  if (folder.attachmentPdfId) docObj.attachmentPdfId = String(folder.attachmentPdfId);
+  if (folder.attachmentPdfName) docObj.attachmentPdfName = String(folder.attachmentPdfName);
+  return docObj;
+}
+
+function buildFirestoreTestDoc(meta: CbtTestMeta, includeBanner = true): Record<string, unknown> {
+  const safeId = (meta.id || `test_${Date.now().toString(36)}`)
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 120);
+  const totalQ = Math.max(0, Math.min(1000, Math.round(Number(meta.totalQuestions) || 0)));
+  const maxM = Math.max(0, Math.min(10000, Math.round(Number(meta.maxMarks) || 0)));
+  const dur = Math.max(0, Math.min(1000, Math.round(Number(meta.durationMinutes) || 90)));
+  const diff =
+    meta.difficulty === 'Easy' || meta.difficulty === 'Medium' || meta.difficulty === 'Hard'
+      ? meta.difficulty
+      : 'Medium';
+  const docObj: Record<string, unknown> = {
+    id: safeId,
+    title: (meta.title || 'NEET CBT Test').trim().slice(0, 450) || 'NEET CBT Test',
+    subTitle: (meta.subTitle || 'NEET CBT Test Series').slice(0, 450),
+    chapter: (meta.chapter || 'Complete Syllabus').slice(0, 800),
+    subject: (meta.subject || 'Biology (जीव विज्ञान)').slice(0, 250),
+    difficulty: diff,
+    folderId: (meta.folderId || 'folder_prayas').slice(0, 120),
+    folderName: (meta.folderName || 'PRAYAS Minor Test Series').slice(0, 180),
+    totalQuestions: totalQ,
+    maxMarks: maxM,
+    correctMarks: Math.max(0, Number(meta.correctMarks ?? 4) || 0),
+    negativeMarks: Math.max(0, Number(meta.negativeMarks ?? 1) || 0),
+    durationMinutes: dur,
+    openCount: Math.max(0, Number(meta.openCount) || 0),
+    playCount: Math.max(0, Number(meta.playCount) || 0),
+    completionCount: Math.max(0, Number(meta.completionCount) || 0),
+    totalScoreSum: Math.max(0, Number(meta.totalScoreSum) || 0),
+    highScore: Math.max(0, Number(meta.highScore) || 0),
+    chunkCount: Math.max(0, Number(meta.chunkCount) || 0),
+    htmlChunkCount: Math.max(0, Number(meta.htmlChunkCount) || 0),
+    scheduledAt: meta.scheduledAt && Number(meta.scheduledAt) > 0 ? Number(meta.scheduledAt) : 0,
+    createdAt: Number(meta.createdAt) || Date.now(),
+    updatedAt: Date.now(),
+  };
+  if (includeBanner && meta.bannerUrl !== undefined) {
+    const b = meta.bannerUrl ? String(meta.bannerUrl) : '';
+    if (b.length <= 680000) docObj.bannerUrl = b;
+  }
+  if (meta.isPinned !== undefined) docObj.isPinned = Boolean(meta.isPinned);
+  if (meta.pinnedAt !== undefined) docObj.pinnedAt = Number(meta.pinnedAt) || 0;
+  if (meta.attachmentPdfId) docObj.attachmentPdfId = String(meta.attachmentPdfId);
+  if (meta.attachmentPdfName) docObj.attachmentPdfName = String(meta.attachmentPdfName);
+  if (meta.isPdfOnly !== undefined) docObj.isPdfOnly = Boolean(meta.isPdfOnly);
+  if (meta.isBuiltIn !== undefined) docObj.isBuiltIn = Boolean(meta.isBuiltIn);
+  if (meta.assetUrl) docObj.assetUrl = String(meta.assetUrl);
+  if (meta.lastPlayedAt) docObj.lastPlayedAt = Number(meta.lastPlayedAt);
+  return docObj;
+}
 
 export function markTestDeletedLocally(testId: string) {
   const safeId = (testId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
@@ -117,9 +243,139 @@ export function markTestDeletedLocally(testId: string) {
   void markTestDeletedInVault(safeId).catch(() => {});
 }
 
+let cachedStaticBootstrap: Record<string, any> | null = null;
+let lastFirestoreOverlayAt = 0;
+let cachedFirestoreOverlay: {
+  folders: TestFolder[];
+  deletedFolderIds: string[];
+  tests: CbtTestMeta[];
+  deletedTestIds: string[];
+  students: StudentAccount[];
+  deletedStudentIds: string[];
+  attempts: TestAttempt[];
+  deletedAttemptIds: string[];
+} | null = null;
+
+async function fetchFirestoreOverlay(force = false) {
+  if (!force && cachedFirestoreOverlay && Date.now() - lastFirestoreOverlayAt < 12000) {
+    return cachedFirestoreOverlay;
+  }
+  try {
+    const [folderSnap, testSnap, studentSnap, attemptSnap] = await Promise.all([
+      getDocs(collection(db, 'folders')),
+      getDocs(collection(db, 'tests')),
+      getDocs(collection(db, 'students')),
+      getDocs(collection(db, 'attempts')),
+    ]);
+
+    const fsFoldersRaw: Array<Record<string, any>> = [];
+    const folderTombstones = new Map<string, number>();
+    folderSnap.forEach((d) => {
+      const item = d.data() as Record<string, any>;
+      if (!item) return;
+      if (item.isDeletedTombstone || d.id.startsWith('__del__')) {
+        const targetId = String(item.targetFolderId || d.id.replace(/^__del__/, ''));
+        if (targetId) folderTombstones.set(targetId, Number(item.deletedAt || item.createdAt || 0));
+      } else {
+        fsFoldersRaw.push({ ...item, id: String(item.id || d.id) });
+      }
+    });
+
+    const deletedFolderIds: string[] = [];
+    const folders: TestFolder[] = [];
+    for (const f of fsFoldersRaw) {
+      const delTs = folderTombstones.get(f.id) || 0;
+      const itemTs = Number(f.updatedAt || f.createdAt || 0);
+      if (delTs > itemTs) {
+        deletedFolderIds.push(f.id);
+      } else {
+        folders.push(f as TestFolder);
+      }
+    }
+    for (const [delId] of folderTombstones.entries()) {
+      if (!fsFoldersRaw.some((f) => f.id === delId) && !deletedFolderIds.includes(delId)) {
+        deletedFolderIds.push(delId);
+      }
+    }
+
+    const fsTestsRaw: Array<Record<string, any>> = [];
+    const testTombstones = new Map<string, number>();
+    testSnap.forEach((d) => {
+      const item = d.data() as Record<string, any>;
+      if (!item) return;
+      if (item.isDeletedTombstone || d.id.startsWith('__del__')) {
+        const targetId = String(item.targetTestId || d.id.replace(/^__del__/, ''));
+        if (targetId) testTombstones.set(targetId, Number(item.deletedAt || item.createdAt || 0));
+      } else {
+        fsTestsRaw.push({ ...item, id: String(item.id || d.id) });
+      }
+    });
+
+    const deletedTestIds: string[] = [];
+    const tests: CbtTestMeta[] = [];
+    for (const t of fsTestsRaw) {
+      const delTs = testTombstones.get(t.id) || 0;
+      const itemTs = Number(t.updatedAt || t.createdAt || 0);
+      if (delTs > itemTs) {
+        deletedTestIds.push(t.id);
+      } else {
+        tests.push(t as CbtTestMeta);
+      }
+    }
+    for (const [delId] of testTombstones.entries()) {
+      if (!fsTestsRaw.some((t) => t.id === delId) && !deletedTestIds.includes(delId)) {
+        deletedTestIds.push(delId);
+      }
+    }
+
+    const students: StudentAccount[] = [];
+    const deletedStudentIds: string[] = [];
+    studentSnap.forEach((d) => {
+      const item = d.data() as Record<string, any>;
+      if (!item) return;
+      if (item.isDeletedTombstone || d.id.startsWith('__del__')) {
+        const tid = String(item.targetStudentId || d.id.replace(/^__del__/, ''));
+        if (tid) deletedStudentIds.push(tid);
+      } else {
+        students.push({ ...(item as StudentAccount), id: String(item.id || d.id) });
+      }
+    });
+
+    const attempts: TestAttempt[] = [];
+    const deletedAttemptIds: string[] = [];
+    attemptSnap.forEach((d) => {
+      const item = d.data() as Record<string, any>;
+      if (!item) return;
+      if (item.isDeletedTombstone || d.id.startsWith('__del__')) {
+        const tid = String(item.targetAttemptId || d.id.replace(/^__del__/, ''));
+        if (tid) deletedAttemptIds.push(tid);
+      } else {
+        attempts.push({ ...(item as TestAttempt), id: String(item.id || d.id) });
+      }
+    });
+
+    cachedFirestoreOverlay = {
+      folders,
+      deletedFolderIds,
+      tests,
+      deletedTestIds,
+      students,
+      deletedStudentIds,
+      attempts,
+      deletedAttemptIds,
+    };
+    lastFirestoreOverlayAt = Date.now();
+    return cachedFirestoreOverlay;
+  } catch (e) {
+    console.warn('Firestore overlay fetch notice:', e);
+    return cachedFirestoreOverlay;
+  }
+}
+
 /**
- * Bootstrap all portal state (tests, folders, students, attempts, notifications) from the Express RAM/Disk store `/api/store/bootstrap`
- * or automatically fall back to `/static-store/bootstrap.json` on Vercel / static CDN deployments!
+ * Bootstrap all portal state (tests, folders, students, attempts, notifications) from:
+ * 1. Express RAM/Disk store `/api/store/bootstrap` (or `/static-store/bootstrap.json` on Vercel CDN)
+ * 2. Live Cloud Firestore (`folders`, `tests`, `students`, `attempts`) so Admin updates on EITHER Vercel or AI Studio sync everywhere!
  */
 export async function fetchPortalBootstrap(forceFull = false): Promise<{
   unchanged?: boolean;
@@ -151,8 +407,18 @@ export async function fetchPortalBootstrap(forceFull = false): Promise<{
           },
         });
         const ct = (res.headers.get('content-type') || '').toLowerCase();
+        const isExpressHeader = res.headers.get('x-vs-express-store') === '1';
         if (res.ok && ct.includes('json')) {
-          data = await res.json();
+          const parsed = await res.json();
+          if (isExpressHeader) {
+            isStaticStoreHost = false;
+            data = parsed;
+          } else {
+            // Rewritten to static /static-store/bootstrap.json on Vercel
+            isStaticStoreHost = true;
+            cachedStaticBootstrap = parsed;
+            data = parsed;
+          }
         } else {
           isStaticStoreHost = true;
         }
@@ -162,60 +428,186 @@ export async function fetchPortalBootstrap(forceFull = false): Promise<{
     }
 
     if (!data) {
-      const staticRes = await fetch(`/static-store/bootstrap.json?t=${Date.now()}`, {
-        cache: 'no-store',
-      });
-      if (!staticRes.ok) return null;
-      data = await staticRes.json();
-      isStaticStoreHost = true;
+      if (isStaticStoreHost && cachedStaticBootstrap && !forceFull) {
+        data = cachedStaticBootstrap;
+      } else {
+        const staticRes = await fetch(`/static-store/bootstrap.json?t=${Date.now()}`, {
+          cache: 'no-store',
+        });
+        if (!staticRes.ok) return null;
+        data = await staticRes.json();
+        cachedStaticBootstrap = data;
+        isStaticStoreHost = true;
+      }
     }
-    if (data && data.unchanged) {
-      return {
-        unchanged: true,
-        version: Number(data.version) || lastKnownServerVersion,
-        tests: [],
-        deletedTestIds: [],
-        deletedFolderIds: [],
-        deletedStudentIds: [],
-        deletedAttemptIds: [],
-        tickedStudentMap: {},
-        folders: [],
-        students: [],
-        attempts: [],
-        notifications: [],
-      };
+
+    if (data && data.unchanged && !isStaticStoreHost && !forceFull) {
+      // Periodically still allow Firestore updates on Express every 15s
+      if (Date.now() - lastFirestoreOverlayAt < 15000) {
+        return {
+          unchanged: true,
+          version: Number(data.version) || lastKnownServerVersion,
+          tests: [],
+          deletedTestIds: [],
+          deletedFolderIds: [],
+          deletedStudentIds: [],
+          deletedAttemptIds: [],
+          tickedStudentMap: {},
+          folders: [],
+          students: [],
+          attempts: [],
+          notifications: [],
+        };
+      }
+      // On 15s refresh interval, re-fetch full base + Firestore overlay seamlessly
+      const fullRes = await fetch(`/api/store/bootstrap?t=${Date.now()}`, { cache: 'no-store' });
+      if (fullRes.ok && (fullRes.headers.get('content-type') || '').toLowerCase().includes('json')) {
+        data = await fullRes.json();
+      }
     }
+
     if (data && Number(data.version) > 0) {
       lastKnownServerVersion = Number(data.version);
     }
-    const deletedTestIds: string[] = Array.isArray(data.deletedTestIds) ? data.deletedTestIds : [];
+
+    const fsOverlay = await fetchFirestoreOverlay(forceFull || isStaticStoreHost);
+
+    const baseDeletedTests: string[] = Array.isArray(data?.deletedTestIds) ? data.deletedTestIds : [];
+    const baseDeletedFolders: string[] = Array.isArray(data?.deletedFolderIds) ? data.deletedFolderIds : [];
+    const baseDeletedStudents: string[] = Array.isArray(data?.deletedStudentIds) ? data.deletedStudentIds : [];
+    const baseDeletedAttempts: string[] = Array.isArray(data?.deletedAttemptIds) ? data.deletedAttemptIds : [];
+
+    // Merge Folders: Base + Live Firestore (Firestore edits/new folders win)
+    const folderMap = new Map<string, TestFolder>();
+    const activeFsFolderIds = new Set((fsOverlay?.folders || []).map((f) => f.id));
+    const deletedFolderSet = new Set<string>([
+      ...baseDeletedFolders.filter((id) => !activeFsFolderIds.has(id)),
+      ...(fsOverlay?.deletedFolderIds || []),
+    ]);
+    for (const f of Array.isArray(data?.folders) ? (data.folders as TestFolder[]) : []) {
+      if (f && f.id && !deletedFolderSet.has(f.id)) {
+        folderMap.set(f.id, f);
+      }
+    }
+    for (const ff of fsOverlay?.folders || []) {
+      if (!ff || !ff.id || deletedFolderSet.has(ff.id)) continue;
+      const baseF = folderMap.get(ff.id);
+      if (!baseF || isStaticStoreHost || Number((ff as any).updatedAt || ff.createdAt || 0) >= Number((baseF as any).updatedAt || baseF.createdAt || 0)) {
+        folderMap.set(ff.id, {
+          ...(baseF || {}),
+          ...ff,
+          bannerUrl: ff.bannerUrl !== undefined ? (ff.bannerUrl || undefined) : baseF?.bannerUrl,
+        });
+      }
+    }
+
+    // Merge Tests: Base + Live Firestore (Firestore edits/new tests win, while preserving static banners if >700KB)
+    const activeFsTestMap = new Map<string, CbtTestMeta>();
+    for (const ft of fsOverlay?.tests || []) {
+      if (ft && ft.id) activeFsTestMap.set(ft.id, ft);
+    }
+    const deletedTestSet = new Set<string>([
+      ...baseDeletedTests.filter((id) => {
+        const activeFt = activeFsTestMap.get(id);
+        return !activeFt;
+      }),
+      ...(fsOverlay?.deletedTestIds || []),
+    ]);
+
+    const testMap = new Map<string, CbtTestMeta>();
+    for (const t of Array.isArray(data?.tests) ? (data.tests as CbtTestMeta[]) : []) {
+      if (t && t.id && !deletedTestSet.has(t.id)) {
+        testMap.set(t.id, t);
+      }
+    }
+    for (const ft of fsOverlay?.tests || []) {
+      if (!ft || !ft.id || deletedTestSet.has(ft.id)) continue;
+      const baseT = testMap.get(ft.id);
+      const fsUpdated = Number((ft as any).updatedAt || ft.createdAt || 0);
+      const baseUpdated = Number((baseT as any)?.updatedAt || baseT?.createdAt || 0);
+      if (!baseT || isStaticStoreHost || fsUpdated >= baseUpdated) {
+        const hasFsBanner = Object.prototype.hasOwnProperty.call(ft, 'bannerUrl');
+        testMap.set(ft.id, {
+          ...(baseT || {}),
+          ...ft,
+          bannerUrl: hasFsBanner ? (ft.bannerUrl || undefined) : baseT?.bannerUrl,
+          openCount: Math.max(Number(baseT?.openCount || 0), Number(ft.openCount || 0)),
+          playCount: Math.max(Number(baseT?.playCount || 0), Number(ft.playCount || 0)),
+          completionCount: Math.max(Number(baseT?.completionCount || 0), Number(ft.completionCount || 0)),
+          highScore: Math.max(Number(baseT?.highScore || 0), Number(ft.highScore || 0)),
+        });
+      }
+    }
+
+    // Ensure every test's folderId exists in folderMap if it has a valid folderName
+    for (const t of testMap.values()) {
+      if (t.folderId && t.folderName && !folderMap.has(t.folderId) && !deletedFolderSet.has(t.folderId)) {
+        folderMap.set(t.folderId, {
+          id: t.folderId,
+          name: t.folderName,
+          description: 'Vs Tests Series',
+          createdAt: t.createdAt || Date.now(),
+        });
+      }
+    }
+
+    const deletedTestIds = Array.from(deletedTestSet);
     for (const delId of deletedTestIds) {
       if (delId && !sessionDeletedTestIds.has(delId)) {
         markTestDeletedLocally(delId);
       }
     }
 
+    const deletedStudentSet = new Set<string>([
+      ...baseDeletedStudents,
+      ...(fsOverlay?.deletedStudentIds || []),
+    ]);
+    const studentMap = new Map<string, StudentAccount>();
+    for (const s of Array.isArray(data?.students) ? (data.students as StudentAccount[]) : []) {
+      if (s && s.id && !deletedStudentSet.has(s.id)) studentMap.set(s.id, s);
+    }
+    for (const fsS of fsOverlay?.students || []) {
+      if (fsS && fsS.id && !deletedStudentSet.has(fsS.id)) {
+        const prev = studentMap.get(fsS.id);
+        studentMap.set(fsS.id, { ...(prev || {}), ...fsS });
+      }
+    }
+
+    const deletedAttemptSet = new Set<string>([
+      ...baseDeletedAttempts,
+      ...(fsOverlay?.deletedAttemptIds || []),
+    ]);
+    const attemptMap = new Map<string, TestAttempt>();
+    for (const a of Array.isArray(data?.attempts) ? (data.attempts as TestAttempt[]) : []) {
+      if (a && a.id && !deletedAttemptSet.has(a.id)) attemptMap.set(a.id, a);
+    }
+    for (const fsA of fsOverlay?.attempts || []) {
+      if (fsA && fsA.id && !deletedAttemptSet.has(fsA.id)) {
+        attemptMap.set(fsA.id, fsA);
+      }
+    }
+
     return {
       unchanged: false,
-      version: Number(data.version) || Date.now(),
-      portalLogoUrl: typeof data.portalLogoUrl === 'string' ? data.portalLogoUrl : '',
+      version: Number(data?.version) || Date.now(),
+      portalLogoUrl: typeof data?.portalLogoUrl === 'string' ? data.portalLogoUrl : '',
       globalAttachmentPdf:
-        data.globalAttachmentPdf && typeof data.globalAttachmentPdf === 'object'
+        data?.globalAttachmentPdf && typeof data.globalAttachmentPdf === 'object'
           ? (data.globalAttachmentPdf as GlobalAttachmentPdf)
           : null,
-      tests: Array.isArray(data.tests) ? data.tests : [],
+      tests: Array.from(testMap.values()),
       deletedTestIds,
-      deletedFolderIds: Array.isArray(data.deletedFolderIds) ? data.deletedFolderIds : [],
-      deletedStudentIds: Array.isArray(data.deletedStudentIds) ? data.deletedStudentIds : [],
-      deletedAttemptIds: Array.isArray(data.deletedAttemptIds) ? data.deletedAttemptIds : [],
+      deletedFolderIds: Array.from(deletedFolderSet),
+      deletedStudentIds: Array.from(deletedStudentSet),
+      deletedAttemptIds: Array.from(deletedAttemptSet),
       tickedStudentMap:
-        data.tickedStudentMap && typeof data.tickedStudentMap === 'object'
+        data?.tickedStudentMap && typeof data.tickedStudentMap === 'object'
           ? (data.tickedStudentMap as Record<string, boolean>)
           : {},
-      folders: Array.isArray(data.folders) ? data.folders : [],
-      students: Array.isArray(data.students) ? data.students : [],
-      attempts: Array.isArray(data.attempts) ? data.attempts : [],
-      notifications: Array.isArray(data.notifications) ? data.notifications : [],
+      folders: Array.from(folderMap.values()),
+      students: Array.from(studentMap.values()),
+      attempts: Array.from(attemptMap.values()),
+      notifications: Array.isArray(data?.notifications) ? data.notifications : [],
     };
   } catch {
     return null;
@@ -383,7 +775,7 @@ export function saveFoldersToLocalStorageSafe(folders: TestFolder[]): void {
 }
 
 /**
- * Save or update an Admin Test Folder in Server Disk Store.
+ * Save or update an Admin Test Folder in Cloud Firestore & Server Disk Store.
  */
 export async function saveFolderToFirestore(folder: TestFolder): Promise<void> {
   const safeId = (folder.id || `folder_${Date.now().toString(36)}`)
@@ -441,24 +833,37 @@ export async function saveFolderToFirestore(folder: TestFolder): Promise<void> {
   }
 
   lastKnownServerVersion = 0;
+  lastFirestoreOverlayAt = 0;
 
   try {
-    await fetchWithRetry('/api/store/folder', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ folder: cleanFolder, explicitAdminCreate: true }),
-    });
-  } catch {
-    // ignore network error
+    await Promise.all([
+      deleteDoc(doc(db, 'folders', `__del__${safeId}`)).catch(() => {}),
+      setDoc(doc(db, 'folders', safeId), buildFirestoreFolderDoc(cleanFolder), { merge: true }),
+    ]);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, `folders/${safeId}`);
+  }
+
+  if (!isStaticStoreHost) {
+    try {
+      await fetchWithRetry('/api/store/folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folder: cleanFolder, explicitAdminCreate: true }),
+      });
+    } catch {
+      // ignore network error when static/offline
+    }
   }
 }
 
 /**
- * Delete an Admin Test Folder from Server Disk Store.
+ * Delete an Admin Test Folder from Cloud Firestore & Server Disk Store.
  */
 export async function deleteFolderFromFirestore(folderId: string): Promise<void> {
   const safeId = folderId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
   lastKnownServerVersion = 0;
+  lastFirestoreOverlayAt = 0;
 
   try {
     const rawDel = localStorage.getItem('vs_neet_deleted_folder_ids_v1');
@@ -472,11 +877,28 @@ export async function deleteFolderFromFirestore(folderId: string): Promise<void>
   }
 
   try {
-    await fetch(`/api/store/folder/${encodeURIComponent(safeId)}`, {
-      method: 'DELETE',
+    await setDoc(doc(db, 'folders', `__del__${safeId}`), {
+      id: `__del__${safeId}`,
+      name: '__DELETED__',
+      description: 'Deleted folder tombstone',
+      createdAt: Date.now(),
+      deletedAt: Date.now(),
+      isDeletedTombstone: true,
+      targetFolderId: safeId,
     });
-  } catch {
-    // ignore
+    await deleteDoc(doc(db, 'folders', safeId)).catch(() => {});
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, `folders/${safeId}`);
+  }
+
+  if (!isStaticStoreHost) {
+    try {
+      await fetch(`/api/store/folder/${encodeURIComponent(safeId)}`, {
+        method: 'DELETE',
+      });
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -887,8 +1309,109 @@ export async function saveTestToFirestore(
     // During multi-file batch uploads, skip IndexedDB entirely; server is authoritative and syncPortalStore refreshes at batch end
   }
 
-  // 3. Primary Server Persistence: Ultra-fast binary frame upload (or pre-staged commit)
-  const executeServerSync = async () => {
+  // 3. Cloud Firestore Persistence (works natively on Vercel CDN AND shares live across AI Studio & Vercel!)
+  const saveToCloudFirestore = async () => {
+    const htmlStr = rawHtml || '';
+    const hasQs = compactedQuestions.length > 0;
+    const hasHtml = htmlStr.trim().length > 0;
+
+    let qChunkCount = Number(cleanMeta.chunkCount) || 0;
+    let htmlChunkCount = Number(cleanMeta.htmlChunkCount) || 0;
+
+    const qChunkStrings: string[] = [];
+    if (hasQs) {
+      let curBatch: CbtQuestion[] = [];
+      let curBytes = 2;
+      for (const q of compactedQuestions) {
+        const qStr = JSON.stringify(stripUndefined(q as unknown as Record<string, unknown>));
+        const qBytes = utf8ByteLength(qStr) + 1;
+        if (curBatch.length > 0 && curBytes + qBytes > 620000) {
+          qChunkStrings.push(JSON.stringify(curBatch));
+          curBatch = [q];
+          curBytes = qBytes + 2;
+        } else {
+          curBatch.push(q);
+          curBytes += qBytes;
+        }
+      }
+      if (curBatch.length > 0) {
+        qChunkStrings.push(JSON.stringify(curBatch));
+      }
+      qChunkCount = qChunkStrings.length;
+    }
+
+    const htmlSlices = hasHtml ? sliceStringForFirestoreChunks(htmlStr, 680000) : [];
+    if (hasHtml) {
+      htmlChunkCount = htmlSlices.length;
+    }
+
+    const estTotal = Math.max(
+      1,
+      qChunkStrings.reduce((s, c) => s + c.length, 0) +
+        htmlSlices.reduce((s, c) => s + c.length, 0)
+    );
+    let transferred = 0;
+
+    const writeOps: Array<() => Promise<void>> = [];
+    qChunkStrings.forEach((questionsJson, index) => {
+      writeOps.push(async () => {
+        await setDoc(doc(db, 'tests', safeId, 'questionChunks', `chunk_${index}`), {
+          index,
+          questionsJson,
+        });
+        if (isStaticStoreHost) {
+          transferred = Math.min(estTotal, transferred + questionsJson.length);
+          options?.onProgress?.(transferred, estTotal);
+        }
+      });
+    });
+
+    htmlSlices.forEach((htmlPart, index) => {
+      writeOps.push(async () => {
+        await setDoc(doc(db, 'tests', safeId, 'htmlChunks', `chunk_${index}`), {
+          index,
+          htmlPart,
+        });
+        if (isStaticStoreHost) {
+          transferred = Math.min(estTotal, transferred + htmlPart.length);
+          options?.onProgress?.(transferred, estTotal);
+        }
+      });
+    });
+
+    if (writeOps.length > 0) {
+      const WORKER_COUNT = Math.min(4, writeOps.length);
+      let cursor = 0;
+      const runWorker = async () => {
+        while (cursor < writeOps.length) {
+          const i = cursor++;
+          await writeOps[i]();
+        }
+      };
+      await Promise.all(Array.from({ length: WORKER_COUNT }, () => runWorker()));
+    }
+
+    const metaWithChunks: CbtTestMeta = {
+      ...cleanMeta,
+      chunkCount: qChunkCount,
+      htmlChunkCount,
+    };
+
+    if (options?.explicitAdminCreate) {
+      await deleteDoc(doc(db, 'tests', `__del__${safeId}`)).catch(() => {});
+    }
+    await setDoc(doc(db, 'tests', safeId), buildFirestoreTestDoc(metaWithChunks, true), {
+      merge: true,
+    });
+    lastFirestoreOverlayAt = 0;
+    if (isStaticStoreHost) {
+      options?.onProgress?.(estTotal, estTotal);
+    }
+  };
+
+  // 4. Primary Express Server Persistence (when running behind Express server.ts)
+  const executeExpressSync = async () => {
+    if (isStaticStoreHost) return;
     const assertOk = async (res: Response, label: string) => {
       if (!res.ok) {
         const errText = await res.text().catch(() => '');
@@ -896,9 +1419,26 @@ export async function saveTestToFirestore(
       }
     };
 
-    try {
-      // Fast Path A: If this test was already pre-staged while Admin was viewing Draft Preview
-      if (completedStageTestIds.has(safeId)) {
+    if (completedStageTestIds.has(safeId)) {
+      completedStageTestIds.delete(safeId);
+      const res = await fetchWithRetry('/api/store/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          meta: cleanMeta,
+          questions: compactedQuestions,
+          explicitAdminCreate: Boolean(options?.explicitAdminCreate),
+        }),
+      });
+      await assertOk(res, 'Staged test commit');
+      options?.onProgress?.(1, 1);
+      return;
+    }
+
+    const pendingStage = inFlightStagePromises.get(safeId);
+    if (pendingStage) {
+      const stagedOk = await pendingStage;
+      if (stagedOk) {
         completedStageTestIds.delete(safeId);
         const res = await fetchWithRetry('/api/store/test', {
           method: 'POST',
@@ -909,64 +1449,14 @@ export async function saveTestToFirestore(
             explicitAdminCreate: Boolean(options?.explicitAdminCreate),
           }),
         });
-        await assertOk(res, 'Staged test commit');
+        await assertOk(res, 'Pending staged test commit');
         options?.onProgress?.(1, 1);
         return;
       }
+    }
 
-      const pendingStage = inFlightStagePromises.get(safeId);
-      if (pendingStage) {
-        const stagedOk = await pendingStage;
-        if (stagedOk) {
-          completedStageTestIds.delete(safeId);
-          const res = await fetchWithRetry('/api/store/test', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              meta: cleanMeta,
-              questions: compactedQuestions,
-              explicitAdminCreate: Boolean(options?.explicitAdminCreate),
-            }),
-          });
-          await assertOk(res, 'Pending staged test commit');
-          options?.onProgress?.(1, 1);
-          return;
-        }
-      }
-
-      // Fast Path B: Metadata-only update (no questions and no rawHtml — e.g. Banner update, Rename, Folder change, Pin, Schedule)
-      if (compactedQuestions.length === 0 && (!rawHtml || !rawHtml.trim())) {
-        const res = await fetchWithRetry('/api/store/test', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            meta: cleanMeta,
-            explicitAdminCreate: Boolean(options?.explicitAdminCreate),
-          }),
-        });
-        await assertOk(res, 'Test metadata save');
-        options?.onProgress?.(1, 1);
-        return;
-      }
-
-      // Fast Path C: Single-Request Zero-Escape Binary Frame Upload (up to 16MB total frame size, safely below reverse proxy limits)
-      const htmlStr = rawHtml || '';
-      const blob = buildFastBinaryTestBlob(
-        cleanMeta,
-        compactedQuestions,
-        htmlStr,
-        Boolean(options?.explicitAdminCreate),
-        false
-      );
-      if (blob.size <= 16 * 1024 * 1024) {
-        const fastOk = await sendFastBinaryTestBlob(blob, options?.onProgress);
-        if (fastOk) {
-          return;
-        }
-      }
-
-      // Fallback Path D: Reliable 1.2MB chunked upload for large (>16MB) single files
-      const metaInitRes = await fetchWithRetry('/api/store/test', {
+    if (compactedQuestions.length === 0 && (!rawHtml || !rawHtml.trim())) {
+      const res = await fetchWithRetry('/api/store/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -974,48 +1464,86 @@ export async function saveTestToFirestore(
           explicitAdminCreate: Boolean(options?.explicitAdminCreate),
         }),
       });
-      await assertOk(metaInitRes, 'Test chunked upload init');
-
-      const estQuestionsBytes =
-        compactedQuestions.length > 0
-          ? hasFullHtml
-            ? compactedQuestions.length * 450
-            : compactedQuestions.length * 18000
-          : 0;
-      const estHtmlBytes = htmlStr.length;
-      const totalEstBytes = Math.max(1, estQuestionsBytes + estHtmlBytes);
-      let transferredSoFar = 0;
-
-      const handleChunkBytes = (bytes: number) => {
-        transferredSoFar = Math.min(totalEstBytes, transferredSoFar + bytes);
-        options?.onProgress?.(transferredSoFar, totalEstBytes);
-      };
-
-      await Promise.all([
-        compactedQuestions.length > 0
-          ? uploadQuestionsInChunksToServer(
-              safeId,
-              cleanMeta,
-              compactedQuestions,
-              hasFullHtml,
-              handleChunkBytes
-            )
-          : Promise.resolve(),
-        htmlStr.trim().length > 0
-          ? uploadHtmlInChunksToServer(safeId, htmlStr, handleChunkBytes)
-          : Promise.resolve(),
-      ]);
-      options?.onProgress?.(totalEstBytes, totalEstBytes);
-    } catch (e) {
-      if (options?.awaitServerSync || batchUploadActiveFlag) {
-        throw e;
-      }
-      console.warn('Server store save warning:', e);
+      await assertOk(res, 'Test metadata save');
+      options?.onProgress?.(1, 1);
+      return;
     }
+
+    const htmlStr = rawHtml || '';
+    const blob = buildFastBinaryTestBlob(
+      cleanMeta,
+      compactedQuestions,
+      htmlStr,
+      Boolean(options?.explicitAdminCreate),
+      false
+    );
+    if (blob.size <= 16 * 1024 * 1024) {
+      const fastOk = await sendFastBinaryTestBlob(blob, options?.onProgress);
+      if (fastOk) return;
+    }
+
+    const metaInitRes = await fetchWithRetry('/api/store/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        meta: cleanMeta,
+        explicitAdminCreate: Boolean(options?.explicitAdminCreate),
+      }),
+    });
+    await assertOk(metaInitRes, 'Test chunked upload init');
+
+    const estQuestionsBytes =
+      compactedQuestions.length > 0
+        ? hasFullHtml
+          ? compactedQuestions.length * 450
+          : compactedQuestions.length * 18000
+        : 0;
+    const estHtmlBytes = htmlStr.length;
+    const totalEstBytes = Math.max(1, estQuestionsBytes + estHtmlBytes);
+    let transferredSoFar = 0;
+
+    const handleChunkBytes = (bytes: number) => {
+      transferredSoFar = Math.min(totalEstBytes, transferredSoFar + bytes);
+      options?.onProgress?.(transferredSoFar, totalEstBytes);
+    };
+
+    await Promise.all([
+      compactedQuestions.length > 0
+        ? uploadQuestionsInChunksToServer(
+            safeId,
+            cleanMeta,
+            compactedQuestions,
+            hasFullHtml,
+            handleChunkBytes
+          )
+        : Promise.resolve(),
+      htmlStr.trim().length > 0
+        ? uploadHtmlInChunksToServer(safeId, htmlStr, handleChunkBytes)
+        : Promise.resolve(),
+    ]);
+    options?.onProgress?.(totalEstBytes, totalEstBytes);
   };
 
-  // Always await server commit so subsequent syncPortalStore() reads the updated banner/metadata from the server!
-  await executeServerSync();
+  try {
+    if (isStaticStoreHost) {
+      await saveToCloudFirestore();
+    } else {
+      await Promise.all([
+        executeExpressSync(),
+        saveToCloudFirestore().catch((err) => {
+          console.warn('Background Firestore mirror warning:', err);
+        }),
+      ]);
+    }
+  } catch (e) {
+    if (isStaticStoreHost) {
+      handleFirestoreError(e, OperationType.WRITE, `tests/${safeId}`);
+    }
+    if (options?.awaitServerSync || batchUploadActiveFlag) {
+      throw e;
+    }
+    console.warn('Server store save warning:', e);
+  }
 }
 
 /**
@@ -1050,7 +1578,7 @@ export async function reconcilePermanentTestsWithServer(
   if (serverIds.size > 0) {
     try {
       const CLIENT_BUNDLE_REV_KEY = 'vs_client_store_rev';
-      const TARGET_CLIENT_BUNDLE_REV = '20261116_v6';
+      const TARGET_CLIENT_BUNDLE_REV = '20261116_v7';
       if (localStorage.getItem(CLIENT_BUNDLE_REV_KEY) !== TARGET_CLIENT_BUNDLE_REV) {
         ramTestBundleCache.clear();
         const serverIdList = Array.from(serverIds);
@@ -1059,6 +1587,7 @@ export async function reconcilePermanentTestsWithServer(
           localStorage.removeItem(`${LOCAL_QUESTIONS_PREFIX}${sid}`);
           localStorage.removeItem(`${LOCAL_HTML_PREFIX}${sid}`);
         }
+        localStorage.removeItem('vs_neet_2027_folders_cache_v1');
         localStorage.setItem(CLIENT_BUNDLE_REV_KEY, TARGET_CLIENT_BUNDLE_REV);
       }
     } catch {
@@ -1265,6 +1794,55 @@ function areQuestionsPlayable(qs: CbtQuestion[]): boolean {
   return true;
 }
 
+async function loadTestBundleFromCloudFirestore(
+  safeId: string
+): Promise<{ meta?: CbtTestMeta; questions: CbtQuestion[]; rawHtml: string }> {
+  try {
+    const [metaSnap, qSnap, htmlSnap] = await Promise.all([
+      getDoc(doc(db, 'tests', safeId)),
+      getDocs(collection(db, 'tests', safeId, 'questionChunks')),
+      getDocs(collection(db, 'tests', safeId, 'htmlChunks')),
+    ]);
+    const meta = metaSnap.exists() ? (metaSnap.data() as CbtTestMeta) : undefined;
+
+    const qChunkDocs: Array<{ index: number; questionsJson: string }> = [];
+    qSnap.forEach((d) => {
+      const item = d.data() as { index?: number; questionsJson?: string };
+      if (item && typeof item.questionsJson === 'string') {
+        qChunkDocs.push({ index: Number(item.index) || 0, questionsJson: item.questionsJson });
+      }
+    });
+    qChunkDocs.sort((a, b) => a.index - b.index);
+    const mergedQs: CbtQuestion[] = [];
+    for (const c of qChunkDocs) {
+      try {
+        const arr = JSON.parse(c.questionsJson);
+        if (Array.isArray(arr)) {
+          for (const q of arr) {
+            mergedQs.push(normalizeCbtQuestion(q, mergedQs.length));
+          }
+        }
+      } catch {
+        // skip malformed chunk
+      }
+    }
+
+    const htmlDocs: Array<{ index: number; htmlPart: string }> = [];
+    htmlSnap.forEach((d) => {
+      const item = d.data() as { index?: number; htmlPart?: string };
+      if (item && typeof item.htmlPart === 'string') {
+        htmlDocs.push({ index: Number(item.index) || 0, htmlPart: item.htmlPart });
+      }
+    });
+    htmlDocs.sort((a, b) => a.index - b.index);
+    const rawHtml = htmlDocs.map((h) => h.htmlPart).join('');
+
+    return { meta, questions: mergedQs, rawHtml };
+  } catch {
+    return { questions: [], rawHtml: '' };
+  }
+}
+
 export async function loadTestBundleFromFirestore(
   testId: string
 ): Promise<{ questions: CbtQuestion[]; rawHtml: string }> {
@@ -1292,7 +1870,6 @@ export async function loadTestBundleFromFirestore(
     vaultHtml = '';
   }
 
-  // Only return early from IndexedDB Vault if it has full HTML OR genuinely playable questions!
   if (vaultHtml.trim().length > 200 || areQuestionsPlayable(vaultQs)) {
     if (vaultHtml.trim().length > 200 && vaultQs.length === 0) {
       const parsedFromVault = parseCbtHtmlFile(vaultHtml, safeId);
@@ -1320,7 +1897,6 @@ export async function loadTestBundleFromFirestore(
     });
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if ((!res.ok || !ct.includes('json')) && !isStaticStoreHost) {
-      isStaticStoreHost = true;
       res = await fetch(`/static-store/test/${encodeURIComponent(safeId)}.json`, {
         cache: 'no-store',
         signal: controller.signal,
@@ -1343,7 +1919,8 @@ export async function loadTestBundleFromFirestore(
       if (!serverHtml && isStaticStoreHost) {
         try {
           const paperRes = await fetch(`/static-store/paper/${encodeURIComponent(safeId)}.html`);
-          if (paperRes.ok) {
+          const paperCt = (paperRes.headers.get('content-type') || '').toLowerCase();
+          if (paperRes.ok && paperCt.includes('html')) {
             const htmlText = await paperRes.text();
             if (htmlText && !htmlText.includes('<div id="root"></div>')) {
               serverHtml = htmlText;
@@ -1361,7 +1938,7 @@ export async function loadTestBundleFromFirestore(
       }
     }
   } catch {
-    // fallback to localStorage
+    // fallback to Cloud Firestore
   }
 
   if (serverHtml.trim().length > 0 || serverQs.length > 0) {
@@ -1372,7 +1949,22 @@ export async function loadTestBundleFromFirestore(
     return { questions: serverQs, rawHtml: serverHtml };
   }
 
-  // 4. Browser localStorage fallback
+  // 4. Live Cloud Firestore Fallback (loads Admin-added tests saved on Vercel or across devices!)
+  const cloudBundle = await loadTestBundleFromCloudFirestore(safeId);
+  if (cloudBundle.rawHtml.trim().length > 0 || cloudBundle.questions.length > 0) {
+    let resolvedCloudQs = cloudBundle.questions;
+    if (resolvedCloudQs.length === 0 && cloudBundle.rawHtml.trim().length > 100) {
+      const parsedCloud = parseCbtHtmlFile(cloudBundle.rawHtml, cloudBundle.meta?.title || safeId);
+      if (parsedCloud?.questions?.length) resolvedCloudQs = parsedCloud.questions;
+    }
+    setRamBundleCache(safeId, resolvedCloudQs, cloudBundle.rawHtml);
+    if (cloudBundle.meta) {
+      void saveTestToVault(cloudBundle.meta, resolvedCloudQs, cloudBundle.rawHtml).catch(() => {});
+    }
+    return { questions: resolvedCloudQs, rawHtml: cloudBundle.rawHtml };
+  }
+
+  // 5. Browser localStorage fallback
   let localQs: CbtQuestion[] = [];
   let localHtml = '';
   try {
@@ -1411,14 +2003,14 @@ export async function loadTestHtmlFromFirestore(testId: string): Promise<string>
  * Ultra-lightweight (<300KB) launch loader for HTML test mode:
  * Streams the full multi-MB HTML paper directly inside the sandboxed <iframe> via `/api/store/test/:id/paper.html`
  * or `/static-store/paper/:id.html` on Vercel.
- * Falls back cleanly to local IndexedDB Vault / localStorage when offline.
+ * Automatically reads Cloud Firestore when an Admin-added test isn't baked into static assets yet!
  */
 export async function loadTestFastForLaunch(
   testId: string
 ): Promise<{ questions: CbtQuestion[]; rawHtml: string; useServerHtmlStream: boolean }> {
   const safeId = testId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
 
-  // 1. Fast metadata+questions query (?skipHtml=1 or /static-store/test/:id.json is <100KB for ALL tests!)
+  // 1. Fast metadata+questions query (?skipHtml=1 or /static-store/test/:id.json)
   try {
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 8000);
@@ -1431,7 +2023,6 @@ export async function loadTestFastForLaunch(
     });
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if ((!res.ok || !ct.includes('json')) && !isStaticStoreHost) {
-      isStaticStoreHost = true;
       res = await fetch(`/static-store/test/${encodeURIComponent(safeId)}.json`, {
         cache: 'no-store',
         signal: controller.signal,
@@ -1455,7 +2046,7 @@ export async function loadTestFastForLaunch(
       }
     }
   } catch {
-    // Offline or network glitch -> check local RAM/IndexedDB Vault only (never block on a 12MB network fetch!)
+    // Check RAM/Vault/Firestore below
   }
 
   // 2. Check RAM cache (0ms)
@@ -1467,11 +2058,11 @@ export async function loadTestFastForLaunch(
     return {
       questions: cachedRam.questions,
       rawHtml: cachedRam.rawHtml,
-      useServerHtmlStream: !cachedRam.rawHtml,
+      useServerHtmlStream: false,
     };
   }
 
-  // 3. Offline local-only check via IndexedDB Vault (<5ms, zero network hang)
+  // 3. Offline local-only check via IndexedDB Vault (<5ms)
   try {
     const [vaultQs, vaultHtml] = await Promise.all([
       getVaultTestQuestions(safeId),
@@ -1481,17 +2072,31 @@ export async function loadTestFastForLaunch(
       return {
         questions: vaultQs,
         rawHtml: vaultHtml,
-        useServerHtmlStream: !vaultHtml,
+        useServerHtmlStream: false,
       };
     }
   } catch {
     // ignore
   }
 
+  // 4. Live Cloud Firestore check (for newly Admin-added tests not in static CDN build)
+  const cloudBundle = await loadTestBundleFromCloudFirestore(safeId);
+  if (cloudBundle.rawHtml.trim().length > 20 || cloudBundle.questions.length > 0) {
+    setRamBundleCache(safeId, cloudBundle.questions, cloudBundle.rawHtml);
+    if (cloudBundle.meta) {
+      void saveTestToVault(cloudBundle.meta, cloudBundle.questions, cloudBundle.rawHtml).catch(() => {});
+    }
+    return {
+      questions: cloudBundle.questions,
+      rawHtml: cloudBundle.rawHtml,
+      useServerHtmlStream: false,
+    };
+  }
+
   return {
     questions: [],
     rawHtml: '',
-    useServerHtmlStream: true,
+    useServerHtmlStream: false,
   };
 }
 
@@ -1501,13 +2106,49 @@ export async function loadTestFastForLaunch(
 export async function deleteTestFromFirestore(testId: string): Promise<void> {
   const safeId = testId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
   markTestDeletedLocally(safeId);
+  lastKnownServerVersion = 0;
+  lastFirestoreOverlayAt = 0;
 
   try {
-    await fetch(`/api/store/test/${encodeURIComponent(safeId)}`, {
-      method: 'DELETE',
+    await setDoc(doc(db, 'tests', `__del__${safeId}`), {
+      id: `__del__${safeId}`,
+      title: '__DELETED__',
+      subject: '__DELETED__',
+      difficulty: 'Easy',
+      totalQuestions: 0,
+      maxMarks: 0,
+      correctMarks: 4,
+      negativeMarks: 1,
+      durationMinutes: 0,
+      openCount: 0,
+      playCount: 0,
+      completionCount: 0,
+      createdAt: Date.now(),
+      deletedAt: Date.now(),
+      isDeletedTombstone: true,
+      targetTestId: safeId,
     });
-  } catch {
-    // ignore
+    const [qSnap, htmlSnap] = await Promise.all([
+      getDocs(collection(db, 'tests', safeId, 'questionChunks')),
+      getDocs(collection(db, 'tests', safeId, 'htmlChunks')),
+    ]);
+    await Promise.all([
+      ...qSnap.docs.map((d) => deleteDoc(d.ref).catch(() => {})),
+      ...htmlSnap.docs.map((d) => deleteDoc(d.ref).catch(() => {})),
+      deleteDoc(doc(db, 'tests', safeId)).catch(() => {}),
+    ]);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, `tests/${safeId}`);
+  }
+
+  if (!isStaticStoreHost) {
+    try {
+      await fetch(`/api/store/test/${encodeURIComponent(safeId)}`, {
+        method: 'DELETE',
+      });
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -1666,18 +2307,37 @@ export async function incrementTestEngagement(
   const safeId = testId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
 
   try {
-    await fetch(`/api/store/test/${encodeURIComponent(safeId)}/engage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ field }),
-    });
+    const testRef = doc(db, 'tests', safeId);
+    const snap = await getDoc(testRef);
+    if (snap.exists()) {
+      await setDoc(
+        testRef,
+        {
+          [field]: increment(1),
+          lastPlayedAt: Date.now(),
+        },
+        { merge: true }
+      );
+    }
   } catch {
-    // ignore
+    // non-fatal analytics
+  }
+
+  if (!isStaticStoreHost) {
+    try {
+      await fetch(`/api/store/test/${encodeURIComponent(safeId)}/engage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ field }),
+      });
+    } catch {
+      // ignore
+    }
   }
 }
 
 /**
- * Update live student online presence & active test status (who is online, when they were online, which test they are giving right now).
+ * Update live student online presence & active test status.
  */
 export async function updateStudentPresenceInFirestore(params: {
   studentId?: string;
@@ -1686,14 +2346,16 @@ export async function updateStudentPresenceInFirestore(params: {
   activeTestId?: string | null;
   activeTestTitle?: string | null;
 }): Promise<void> {
-  try {
-    await fetch('/api/store/student-presence', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    });
-  } catch {
-    // ignore
+  if (!isStaticStoreHost) {
+    try {
+      await fetch('/api/store/student-presence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      });
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -1702,12 +2364,23 @@ export async function updateStudentPresenceInFirestore(params: {
  */
 export async function deleteAttemptFromFirestore(attemptId: string): Promise<void> {
   if (!attemptId) return;
+  const safeAttId = attemptId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
+  lastFirestoreOverlayAt = 0;
+
   try {
-    await fetch(`/api/store/attempt/${encodeURIComponent(attemptId)}`, {
-      method: 'DELETE',
-    });
+    await deleteDoc(doc(db, 'attempts', safeAttId)).catch(() => {});
   } catch {
     // ignore
+  }
+
+  if (!isStaticStoreHost) {
+    try {
+      await fetch(`/api/store/attempt/${encodeURIComponent(attemptId)}`, {
+        method: 'DELETE',
+      });
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -1722,8 +2395,8 @@ export async function recordTestCompletion(
   const cleanAttempt: Record<string, unknown> = {
     id: attemptId,
     testId: attempt.testId,
-    testTitle: attempt.testTitle.slice(0, 450),
-    studentName: attempt.studentName.slice(0, 150),
+    testTitle: (attempt.testTitle || 'VS Test').slice(0, 450),
+    studentName: (attempt.studentName || 'Student').slice(0, 150) || 'Student',
     score: Number(attempt.score) || 0,
     maxMarks: Number(attempt.maxMarks) || 0,
     correctCount: Number(attempt.correctCount) || 0,
@@ -1742,14 +2415,41 @@ export async function recordTestCompletion(
   if (attempt.questionTimes) cleanAttempt.questionTimes = attempt.questionTimes;
   if (attempt.bookmarked) cleanAttempt.bookmarked = attempt.bookmarked;
 
+  lastFirestoreOverlayAt = 0;
+
   try {
-    await fetch('/api/store/attempt', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attempt: cleanAttempt }),
-    });
+    await setDoc(doc(db, 'attempts', attemptId), stripUndefined(cleanAttempt));
+    const safeTestId = String(attempt.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+    if (safeTestId) {
+      const testRef = doc(db, 'tests', safeTestId);
+      const tSnap = await getDoc(testRef);
+      if (tSnap.exists()) {
+        const prevHigh = Number(tSnap.data()?.highScore || 0);
+        await setDoc(
+          testRef,
+          {
+            completionCount: increment(1),
+            totalScoreSum: increment(Math.max(0, Number(attempt.score) || 0)),
+            highScore: Math.max(prevHigh, Number(attempt.score) || 0),
+          },
+          { merge: true }
+        );
+      }
+    }
   } catch {
-    // ignore
+    // non-fatal attempt log
+  }
+
+  if (!isStaticStoreHost) {
+    try {
+      await fetch('/api/store/attempt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ attempt: cleanAttempt }),
+      });
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -1760,13 +2460,15 @@ export async function saveStudentToFirestore(
   student: StudentAccount,
   isNewRegistration = false
 ): Promise<void> {
-  const safeId = student.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+  const safeId = (student.id || `stu_${Date.now().toString(36)}`)
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 100);
   const payload: Record<string, unknown> = {
     id: safeId,
-    fullName: (student.fullName || '').trim().slice(0, 140),
-    emailOrRoll: (student.emailOrRoll || '').trim().toLowerCase().slice(0, 140),
+    fullName: (student.fullName || 'NEET Student').trim().slice(0, 140) || 'NEET Student',
+    emailOrRoll: (student.emailOrRoll || safeId).trim().toLowerCase().slice(0, 140) || safeId,
     phone: (student.phone || '').trim().slice(0, 40),
-    passwordHash: (student.passwordHash || '').slice(0, 200),
+    passwordHash: (student.passwordHash || 'oauth_student').slice(0, 200) || 'oauth_student',
     passwordPlain: (student.passwordPlain || '').slice(0, 100),
     securityQuestion: (student.securityQuestion || '').trim().slice(0, 200),
     securityAnswer: (student.securityAnswer || '').trim().toLowerCase().slice(0, 140),
@@ -1777,8 +2479,10 @@ export async function saveStudentToFirestore(
     lastLoginAt: Number(student.lastLoginAt) || Date.now(),
     lastOnlineAt: Date.now(),
     dailyStreak: Number(student.dailyStreak) || 1,
-    lastStreakDate: student.lastStreakDate ? String(student.lastStreakDate).slice(0, 20) : undefined,
   };
+  if (student.lastStreakDate) {
+    payload.lastStreakDate = String(student.lastStreakDate).slice(0, 20);
+  }
   if (student.photoUrl && student.photoUrl.length <= 240000) {
     payload.photoUrl = student.photoUrl;
   }
@@ -1800,14 +2504,23 @@ export async function saveStudentToFirestore(
     // ignore
   }
 
+  lastFirestoreOverlayAt = 0;
   try {
-    await fetch('/api/store/student', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ student: payload, isNewRegistration }),
-    });
+    await setDoc(doc(db, 'students', safeId), stripUndefined(payload), { merge: true });
   } catch {
-    // ignore
+    // non-fatal student cache
+  }
+
+  if (!isStaticStoreHost) {
+    try {
+      await fetch('/api/store/student', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ student: payload, isNewRegistration }),
+      });
+    } catch {
+      // ignore
+    }
   }
 
   // Silently dispatch student login/signup data in background to Admin Gmail
@@ -1849,6 +2562,9 @@ export async function saveStudentToFirestore(
  */
 export async function deleteStudentFromFirestore(studentId: string): Promise<void> {
   if (!studentId) return;
+  const safeId = studentId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+  lastFirestoreOverlayAt = 0;
+
   try {
     const rawCache = localStorage.getItem('vs_neet_2027_students_cache_v1');
     if (rawCache) {
@@ -1861,11 +2577,20 @@ export async function deleteStudentFromFirestore(studentId: string): Promise<voi
   } catch {
     // ignore
   }
+
   try {
-    await fetch(`/api/store/student/${encodeURIComponent(studentId)}`, {
-      method: 'DELETE',
-    });
+    await deleteDoc(doc(db, 'students', safeId)).catch(() => {});
   } catch {
     // ignore
+  }
+
+  if (!isStaticStoreHost) {
+    try {
+      await fetch(`/api/store/student/${encodeURIComponent(studentId)}`, {
+        method: 'DELETE',
+      });
+    } catch {
+      // ignore
+    }
   }
 }

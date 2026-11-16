@@ -67,6 +67,7 @@ import {
   saveAdminStudentTickToFirestore,
   markTestDeletedLocally,
   isBatchUploadActive,
+  isUsingStaticStore,
   saveTestsMetaToLocalStorageSafe,
   saveFoldersToLocalStorageSafe,
 } from './firebase';
@@ -1360,6 +1361,7 @@ function AppContent() {
           `${x.id}_${x.title}_${x.totalQuestions || 0}_${(x.bannerUrl || '').length}_${(x.bannerUrl || '').slice(-40)}_${x.scheduledAt || 0}_${x.isPinned ? 1 : 0}_${x.pinnedAt || 0}_${x.playCount || 0}_${x.completionCount || 0}_${x.folderId || ''}_${x.attachmentPdfId || ''}_${x.isPdfOnly ? 1 : 0}`
       ),
       d: combinedDeletedIds,
+      df: boot.deletedFolderIds || [],
       ds: boot.deletedStudentIds || [],
       da: boot.deletedAttemptIds || [],
       tk: boot.tickedStudentMap || {},
@@ -1448,33 +1450,53 @@ function AppContent() {
       }
     }
 
-    // Authoritative Folders Sync from Server + Local Cache (never inject seed folders if server already has folders)
+    // Authoritative Folders Sync from Server + Firestore + Local Cache (never keep stale DEFAULT_SEED_FOLDERS when server already has folders)
     setFolders((prev) => {
       const map = new Map<string, TestFolder>();
-      const seedFallback =
-        boot.folders.length === 0 && prev.length === 0 && combinedDeletedFolderIds.length === 0
-          ? DEFAULT_SEED_FOLDERS
-          : [];
-      for (const f of [...seedFallback, ...prev]) {
-        if (f && f.id && !deletedFolderSet.has(f.id)) {
-          map.set(f.id, f);
+      const staleSeedFolderIds = new Set(['folder_trackprep', 'folder_ubt_mock']);
+      const referencedFolderIds = new Set(reconciledTests.map((t) => t?.folderId).filter(Boolean));
+      const bootHasFolders = boot.folders.length > 0;
+
+      if (bootHasFolders) {
+        // Put authoritative server+Firestore folders first in exact order
+        for (const f of boot.folders) {
+          if (f && f.id && !deletedFolderSet.has(f.id)) {
+            const prevF = prev.find((p) => p && p.id === f.id);
+            const hasBannerProp = Object.prototype.hasOwnProperty.call(f, 'bannerUrl');
+            map.set(f.id, {
+              ...(prevF || {}),
+              ...f,
+              bannerUrl: hasBannerProp
+                ? f.bannerUrl
+                  ? String(f.bannerUrl)
+                  : undefined
+                : prevF?.bannerUrl,
+            });
+          }
+        }
+        // Only retain extra prev folders if they were not phantom seed folders
+        for (const f of prev) {
+          if (
+            f &&
+            f.id &&
+            !map.has(f.id) &&
+            !deletedFolderSet.has(f.id) &&
+            (!staleSeedFolderIds.has(f.id) || referencedFolderIds.has(f.id)) &&
+            (referencedFolderIds.has(f.id) || !DEFAULT_SEED_FOLDERS.some((sf) => sf.id === f.id))
+          ) {
+            map.set(f.id, f);
+          }
+        }
+      } else {
+        const seedFallback =
+          prev.length === 0 && combinedDeletedFolderIds.length === 0 ? DEFAULT_SEED_FOLDERS : [];
+        for (const f of [...seedFallback, ...prev]) {
+          if (f && f.id && !deletedFolderSet.has(f.id)) {
+            map.set(f.id, f);
+          }
         }
       }
-      for (const f of boot.folders) {
-        if (f && f.id && !deletedFolderSet.has(f.id)) {
-          const prevF = map.get(f.id);
-          const hasBannerProp = Object.prototype.hasOwnProperty.call(f, 'bannerUrl');
-          map.set(f.id, {
-            ...(prevF || {}),
-            ...f,
-            bannerUrl: hasBannerProp
-              ? f.bannerUrl
-                ? String(f.bannerUrl)
-                : undefined
-              : prevF?.bannerUrl,
-          });
-        }
-      }
+
       for (const t of reconciledTests) {
         if (
           t &&
@@ -1496,14 +1518,19 @@ function AppContent() {
       return mergedFolders;
     });
 
-    // Permanent Tests Sync: merges Existing State + Reconciled Vault & Server Tests (never deletes or overwrites banners)
+    // Permanent Tests Sync: merges Existing State + Reconciled Vault & Server Tests (prunes leftover seed prayas_06 if not on server)
     setTests((prev) => {
       const map = new Map<string, CbtTestMeta>();
+      const serverTestIdSet = new Set(reconciledTests.map((t) => t.id));
+      const cleanPrev =
+        reconciledTests.length > 0
+          ? prev.filter((p) => p && p.id && (serverTestIdSet.has(p.id) || !DEFAULT_SEED_TESTS.some((st) => st.id === p.id)))
+          : prev;
       const seedTestFallback =
         boot.tests.length === 0 && reconciledTests.length === 0 && combinedDeletedIds.length === 0
           ? DEFAULT_SEED_TESTS
           : [];
-      const sourceTests = [...seedTestFallback, ...prev, ...reconciledTests];
+      const sourceTests = [...seedTestFallback, ...cleanPrev, ...reconciledTests];
 
       // Build folder-level Syllabus PDF lookup so every test in a folder automatically gets its folder's Syllabus PDF
       const folderPdfLookup = new Map<string, { id: string; name: string }>();
@@ -1703,7 +1730,7 @@ function AppContent() {
     let isUnmounted = false;
 
     const connectSse = () => {
-      if (isUnmounted) return;
+      if (isUnmounted || isUsingStaticStore()) return;
       try {
         if (es) es.close();
         es = new EventSource('/api/store/stream');
@@ -1782,11 +1809,11 @@ function AppContent() {
           } catch {
             // ignore
           }
-          if (!isUnmounted && !reconnectTimer) {
+          if (!isUnmounted && !reconnectTimer && !isUsingStaticStore()) {
             reconnectTimer = window.setTimeout(() => {
               reconnectTimer = null;
               connectSse();
-            }, 2000);
+            }, 3000);
           }
         };
       } catch {
@@ -1796,8 +1823,8 @@ function AppContent() {
 
     connectSse();
 
-    // 2. Fast lightweight background poll (4s-5s using 28-byte sinceVersion fast-path) so live updates never miss even behind mobile proxies
-    const jitterMs = 4000 + Math.floor(Math.random() * 1500);
+    // 2. Fast lightweight background poll (express ~4.5s via 28-byte fast-path, Vercel static via Firestore)
+    const jitterMs = 5000 + Math.floor(Math.random() * 1500);
     const interval = window.setInterval(() => {
       if (!activeRunningTestRef.current) {
         syncPortalStore();
@@ -2609,7 +2636,7 @@ function AppContent() {
         reviewAttempt: null,
       });
 
-      // Hydrate compact answer keys & /qimg URLs silently in the background without blocking UI
+      // Hydrate compact answer keys, /qimg URLs, OR Firestore-backed rawHtml without blocking UI
       if (!hasPlayableCachedQs && test.id !== 'prayas_06') {
         void loadTestFastForLaunch(test.id)
           .then((fastLaunch) => {
@@ -2618,9 +2645,26 @@ function AppContent() {
                 ...prev,
                 [test.id]: fastLaunch.questions,
               }));
+            }
+            if (fastLaunch.rawHtml && fastLaunch.rawHtml.trim().length > 20) {
+              setLocalRawHtmlCache((prev) => ({
+                ...prev,
+                [test.id]: fastLaunch.rawHtml,
+              }));
+            }
+            if (fastLaunch.questions.length > 0 || (fastLaunch.rawHtml && fastLaunch.rawHtml.trim().length > 20)) {
               setActiveRunningTest((prev) =>
                 prev && prev.meta.id === test.id
-                  ? { ...prev, questions: fastLaunch.questions }
+                  ? {
+                      ...prev,
+                      questions:
+                        fastLaunch.questions.length > 0 ? fastLaunch.questions : prev.questions,
+                      rawHtmlContent:
+                        fastLaunch.rawHtml && fastLaunch.rawHtml.trim().length > 20
+                          ? fastLaunch.rawHtml
+                          : prev.rawHtmlContent,
+                      useServerHtmlStream: fastLaunch.useServerHtmlStream,
+                    }
                   : prev
               );
             }
@@ -3333,13 +3377,20 @@ function AppContent() {
     const qLower = String(searchQuery || '').trim().toLowerCase();
     const subjLower = String(subjectFilter || 'ALL').toLowerCase();
     const knownFolderIds = new Set(folders.map((f) => f.id));
-    const fallbackFolderId = folders[0]?.id || 'folder_prayas';
+    const folderIdByNameLower = new Map(
+      folders.map((f) => [String(f.name || '').trim().toLowerCase(), f.id])
+    );
 
     return tests
       .filter((t) => {
         if (!t || !t.id) return false;
+        const nameMatchedFolderId = t.folderName
+          ? folderIdByNameLower.get(String(t.folderName).trim().toLowerCase())
+          : undefined;
         const effectiveFolderId =
-          t.folderId && knownFolderIds.has(t.folderId) ? t.folderId : fallbackFolderId;
+          t.folderId && knownFolderIds.has(t.folderId)
+            ? t.folderId
+            : nameMatchedFolderId || t.folderId || '__unassigned__';
         const matchesFolder =
           selectedFolderFilter === 'ALL' || effectiveFolderId === selectedFolderFilter;
         const tSubj = String(t.subject || '').toLowerCase();
@@ -4971,11 +5022,13 @@ function AppContent() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   {folders.map((folder) => {
                     const knownIds = new Set(folders.map((f) => f.id));
-                    const fallbackId = folders[0]?.id || 'folder_prayas';
+                    const folderNameLower = String(folder.name || '').trim().toLowerCase();
                     const count = tests.filter((t) => {
-                      const effId =
-                        t.folderId && knownIds.has(t.folderId) ? t.folderId : fallbackId;
-                      return effId === folder.id;
+                      if (t.folderId && knownIds.has(t.folderId)) {
+                        return t.folderId === folder.id;
+                      }
+                      const tFolderNameLower = String(t.folderName || '').trim().toLowerCase();
+                      return Boolean(folderNameLower && tFolderNameLower === folderNameLower);
                     }).length;
 
                     return (

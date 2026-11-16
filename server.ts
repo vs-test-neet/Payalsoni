@@ -805,6 +805,7 @@ async function startServer() {
 
   // Ultra-fast 0.01ms RAM bootstrap endpoint supporting 10,000+ concurrent requests
   app.get('/api/store/bootstrap', (req, res) => {
+    res.setHeader('X-VS-Express-Store', '1');
     const clientVersion = Number(req.query.sinceVersion || 0);
     if (clientVersion > 0 && clientVersion === memoryStore.version) {
       res.json({ unchanged: true, version: memoryStore.version });
@@ -1282,21 +1283,24 @@ async function startServer() {
     var origSetItem = Storage.prototype.setItem;
     var origRemoveItem = Storage.prototype.removeItem;
 
+    var isIsolatedCbtKey = function(k) {
+      return Boolean(k && (GENERIC_CBT_KEYS[k] || k.indexOf('neet_cbt_') === 0 || k.indexOf('_v4_state') !== -1 || k.indexOf('cbt_state') !== -1));
+    };
     Storage.prototype.getItem = function(k) {
       try {
-        var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
+        var mapped = (this === window.localStorage && isIsolatedCbtKey(k)) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
         return origGetItem.call(this, mapped);
       } catch(e) { return null; }
     };
     Storage.prototype.setItem = function(k, v) {
       try {
-        var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
+        var mapped = (this === window.localStorage && isIsolatedCbtKey(k)) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
         return origSetItem.call(this, mapped, v);
       } catch(e) {}
     };
     Storage.prototype.removeItem = function(k) {
       try {
-        var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
+        var mapped = (this === window.localStorage && isIsolatedCbtKey(k)) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
         return origRemoveItem.call(this, mapped);
       } catch(e) {}
     };
@@ -1316,12 +1320,12 @@ async function startServer() {
     for (var i = window.localStorage.length - 1; i >= 0; i--) {
       var key = window.localStorage.key(i);
       if (!key) continue;
-      if (key.indexOf('neet_cbt_') === 0 || key.indexOf('_v4_state') !== -1 || key.indexOf('cbt_state') !== -1) {
+      if (key.indexOf('neet_cbt_') !== -1 || key.indexOf('_v4_state') !== -1 || key.indexOf('cbt_state') !== -1) {
         try {
           var rawVal = origGetItem.call(window.localStorage, key);
           if (rawVal && rawVal.charAt(0) === '{') {
             var parsed = JSON.parse(rawVal);
-            if (parsed && (parsed.submitted === true || (typeof parsed.remainingSec === 'number' && parsed.remainingSec <= 60))) {
+            if (parsed && (parsed.submitted === true || parsed.analysisOpen === true || (typeof parsed.remainingSec === 'number' && parsed.remainingSec <= 60))) {
               origRemoveItem.call(window.localStorage, key);
             }
           }
@@ -1905,6 +1909,7 @@ async function startServer() {
   // Zero-RAM direct streaming HTML endpoint for 100% crash-free opening of ANY size or format HTML test
   app.get('/api/store/test/:testId/paper.html', async (req, res) => {
     ensureDataDirs();
+    res.setHeader('X-VS-Express-Store', '1');
     const rawId = String(req.params.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
     const targetMeta = (memoryStore.tests.find((t) => String(t.id) === rawId) || {}) as Record<string, unknown>;
     const acceptsGzip = String(req.headers['accept-encoding'] || '').includes('gzip');
@@ -2003,6 +2008,7 @@ async function startServer() {
   // Supports ?skipHtml=1 to avoid sending multi-MB base64 JSON (replacing inline base64 images with /qimg URLs so response is <30KB!)
   app.get('/api/store/test/:testId', async (req, res) => {
     ensureDataDirs();
+    res.setHeader('X-VS-Express-Store', '1');
     const rawId = String(req.params.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
     const skipHtml = req.query.skipHtml === '1' || req.query.skipHtml === 'true';
     const acceptsGzip = String(req.headers['accept-encoding'] || '').includes('gzip');
@@ -2262,11 +2268,9 @@ async function startServer() {
           memoryStore.tests.unshift(updatedMeta);
         }
 
-        const defaultFolderIds = new Set(['folder_prayas', 'folder_trackprep', 'folder_ubt_mock']);
         if (
           fId &&
           fName &&
-          !defaultFolderIds.has(fId) &&
           !memoryStore.deletedFolderIds.includes(fId) &&
           !memoryStore.folders.some((f) => String(f.id) === fId)
         ) {
@@ -2392,11 +2396,9 @@ async function startServer() {
     }
 
     // Ensure the test's folder exists in memoryStore.folders (unless deleted by Admin)
-    const defaultFolderIds = new Set(['folder_prayas', 'folder_trackprep', 'folder_ubt_mock']);
     if (
       fId &&
       fName &&
-      !defaultFolderIds.has(fId) &&
       !memoryStore.deletedFolderIds.includes(fId) &&
       !memoryStore.folders.some((f) => String(f.id) === fId)
     ) {

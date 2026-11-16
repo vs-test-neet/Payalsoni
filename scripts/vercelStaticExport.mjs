@@ -754,21 +754,24 @@ function patchHtmlForPortalIframe(sourceHtml, opts) {
     var origGetItem = Storage.prototype.getItem;
     var origSetItem = Storage.prototype.setItem;
     var origRemoveItem = Storage.prototype.removeItem;
+    var isIsolatedCbtKey = function(k) {
+      return Boolean(k && (GENERIC_CBT_KEYS[k] || k.indexOf('neet_cbt_') === 0 || k.indexOf('_v4_state') !== -1 || k.indexOf('cbt_state') !== -1));
+    };
     Storage.prototype.getItem = function(k) {
       try {
-        var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
+        var mapped = (this === window.localStorage && isIsolatedCbtKey(k)) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
         return origGetItem.call(this, mapped);
       } catch(e) { return null; }
     };
     Storage.prototype.setItem = function(k, v) {
       try {
-        var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
+        var mapped = (this === window.localStorage && isIsolatedCbtKey(k)) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
         return origSetItem.call(this, mapped, v);
       } catch(e) {}
     };
     Storage.prototype.removeItem = function(k) {
       try {
-        var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
+        var mapped = (this === window.localStorage && isIsolatedCbtKey(k)) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
         return origRemoveItem.call(this, mapped);
       } catch(e) {}
     };
@@ -786,12 +789,12 @@ function patchHtmlForPortalIframe(sourceHtml, opts) {
     for (var i = window.localStorage.length - 1; i >= 0; i--) {
       var key = window.localStorage.key(i);
       if (!key) continue;
-      if (key.indexOf('neet_cbt_') === 0 || key.indexOf('_v4_state') !== -1 || key.indexOf('cbt_state') !== -1) {
+      if (key.indexOf('neet_cbt_') !== -1 || key.indexOf('_v4_state') !== -1 || key.indexOf('cbt_state') !== -1) {
         try {
           var rawVal = origGetItem.call(window.localStorage, key);
           if (rawVal && rawVal.charAt(0) === '{') {
             var parsed = JSON.parse(rawVal);
-            if (parsed && (parsed.submitted === true || (typeof parsed.remainingSec === 'number' && parsed.remainingSec <= 60))) {
+            if (parsed && (parsed.submitted === true || parsed.analysisOpen === true || (typeof parsed.remainingSec === 'number' && parsed.remainingSec <= 60))) {
               origRemoveItem.call(window.localStorage, key);
             }
           }
