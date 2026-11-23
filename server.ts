@@ -10,6 +10,60 @@ import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 
 const gzipAsync = promisify(zlib.gzip);
 const gunzipAsync = promisify(zlib.gunzip);
+const inflateAsync = promisify(zlib.inflate);
+
+// Newer uploader writes test .bin files as ASCII "VS_Test_Z1" + zlib(JSON).
+// Older files are gzip(JSON) or gzip(binary-frame(JSON)). Detect both transparently.
+const VS_TEST_PACK_MAGIC = 'VS_Test_Z1';
+
+function hasVsTestPackMagic(packed: Buffer): boolean {
+  return (
+    packed.byteLength > VS_TEST_PACK_MAGIC.length &&
+    packed.subarray(0, VS_TEST_PACK_MAGIC.length).toString('latin1') === VS_TEST_PACK_MAGIC
+  );
+}
+
+function inflateTestPayloadSync(packed: Buffer): Buffer {
+  if (hasVsTestPackMagic(packed)) {
+    const inflated = zlib.inflateSync(
+      packed.subarray(VS_TEST_PACK_MAGIC.length)
+    );
+    if (isDirectJsonBuffer(inflated)) return inflated;
+    return restoreJsonBufferFromBinaryFrame(inflated);
+  }
+  if (packed.byteLength >= 2 && packed[0] === 0x1f && packed[1] === 0x8b) {
+    return zlib.gunzipSync(packed);
+  }
+  if (packed.byteLength >= 2 && packed[0] === 0x78) {
+    try {
+      return zlib.inflateSync(packed);
+    } catch {
+      // fall through to frame restore
+    }
+  }
+  return packed;
+}
+
+async function inflateTestPayloadAsync(packed: Buffer): Promise<Buffer> {
+  if (hasVsTestPackMagic(packed)) {
+    const inflated = await inflateAsync(
+      packed.subarray(VS_TEST_PACK_MAGIC.length)
+    );
+    if (isDirectJsonBuffer(inflated)) return inflated;
+    return restoreJsonBufferFromBinaryFrame(inflated);
+  }
+  if (packed.byteLength >= 2 && packed[0] === 0x1f && packed[1] === 0x8b) {
+    return gunzipAsync(packed);
+  }
+  if (packed.byteLength >= 2 && packed[0] === 0x78) {
+    try {
+      return await inflateAsync(packed);
+    } catch {
+      // fall through to frame restore
+    }
+  }
+  return packed;
+}
 
 dotenv.config();
 
@@ -305,7 +359,7 @@ function isDirectJsonBuffer(buf: Buffer): boolean {
 }
 
 function unpackBinaryToJsonBuffer(packedGz: Buffer): Buffer {
-  const raw = zlib.gunzipSync(packedGz);
+  const raw = inflateTestPayloadSync(packedGz);
   if (isDirectJsonBuffer(raw)) {
     return raw;
   }
@@ -317,7 +371,7 @@ async function packJsonToBinaryAsync(jsonStr: string): Promise<Buffer> {
 }
 
 async function unpackBinaryToJsonBufferAsync(packedGz: Buffer): Promise<Buffer> {
-  const raw = await gunzipAsync(packedGz);
+  const raw = await inflateTestPayloadAsync(packedGz);
   if (isDirectJsonBuffer(raw)) {
     return raw;
   }
@@ -4067,7 +4121,7 @@ Generate a highly actionable, bilingual (Hindi + English) NCERT-grounded Revisio
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: false, ws: false, watch: null },
+      server: { middlewareMode: true, hmr: false, ws: false, watch: null, allowedHosts: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);

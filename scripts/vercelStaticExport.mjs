@@ -184,10 +184,30 @@ function restoreJsonBufferFromBinaryFrame(raw) {
   return Buffer.from(restored, 'utf-8');
 }
 
+// Newer uploader writes test .bin files as ASCII "VS_Test_Z1" + zlib(JSON).
+// Older files are gzip(JSON), zlib(JSON), raw JSON or gzip(binary-frame(JSON)).
+const VS_TEST_PACK_MAGIC = 'VS_Test_Z1';
+
 function unpackBinaryToJsonBuffer(packed) {
   let raw = packed;
+  if (
+    packed.byteLength > VS_TEST_PACK_MAGIC.length &&
+    packed.subarray(0, VS_TEST_PACK_MAGIC.length).toString('latin1') === VS_TEST_PACK_MAGIC
+  ) {
+    raw = zlib.inflateSync(packed.subarray(VS_TEST_PACK_MAGIC.length));
+    if (isDirectJsonBuffer(raw)) {
+      return raw;
+    }
+    return restoreJsonBufferFromBinaryFrame(raw);
+  }
   if (packed.byteLength >= 2 && packed[0] === 0x1f && packed[1] === 0x8b) {
     raw = zlib.gunzipSync(packed);
+  } else if (packed.byteLength >= 2 && packed[0] === 0x78) {
+    try {
+      raw = zlib.inflateSync(packed);
+    } catch {
+      // fall through
+    }
   }
   if (isDirectJsonBuffer(raw)) {
     return raw;

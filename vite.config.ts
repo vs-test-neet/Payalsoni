@@ -25,6 +25,7 @@ export default defineConfig(() => {
       hmr: false,
       ws: false as const,
       watch: null,
+      allowedHosts: true as const,
     },
   };
 });
