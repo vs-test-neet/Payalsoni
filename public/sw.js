@@ -1,4 +1,4 @@
-const APP_CACHE_NAME = 'vs-test-app-v13';
+const APP_CACHE_NAME = 'vs-test-app-v14';
 const PAPERS_CACHE_NAME = 'vs-test-papers-offline-v1';
 const VALID_CACHES = [APP_CACHE_NAME, PAPERS_CACHE_NAME];
 
@@ -117,13 +117,33 @@ self.addEventListener('fetch', (event) => {
 
     event.respondWith(
       caches.open(PAPERS_CACHE_NAME).then(async (cache) => {
-        const exactMatch = !isExplicitOfflineInline ? await cache.match(event.request) : undefined;
-        const pathMatch =
-          exactMatch ||
-          (!isExplicitOfflineInline ? await cache.match(canonicalPathKey) : undefined) ||
-          (!isExplicitOfflineInline ? await cache.match(event.request, { ignoreSearch: true }) : undefined);
+        const isPaperHtml = url.pathname.endsWith('/paper.html') || url.pathname.startsWith('/static-store/paper/');
+        const cacheKey = url.search.includes('skipHtml=1')
+          ? canonicalPathKey + '?skipHtml=1'
+          : canonicalPathKey;
 
-        const networkFetch = fetch(event.request).then((response) => {
+        if (!isExplicitOfflineInline) {
+          const cachedMatch =
+            (await cache.match(cacheKey)) ||
+            (await cache.match(event.request)) ||
+            (await cache.match(event.request, { ignoreSearch: true }));
+          if (cachedMatch) {
+            // Serve cached test paper instantly in 0ms without saturating mobile RAM/bandwidth by re-downloading 10-12MB in parallel!
+            if (!isPaperHtml && navigator.onLine !== false) {
+              fetch(event.request)
+                .then((fresh) => {
+                  if (fresh && fresh.status === 200) {
+                    cache.put(cacheKey, fresh).catch(() => {});
+                  }
+                })
+                .catch(() => {});
+            }
+            return cachedMatch;
+          }
+        }
+
+        try {
+          const response = await fetch(event.request);
           if (response && response.status === 200) {
             const ct = (response.headers.get('content-type') || '').toLowerCase();
             if (
@@ -133,30 +153,12 @@ self.addEventListener('fetch', (event) => {
               ct.includes('pdf') ||
               ct.includes('octet-stream')
             ) {
-              // Always save under both the exact URL and canonical path key.
-              // If an explicit ?offline=1 full-inline paper is fetched, save it as the canonical paper so offline mode has 100% inline images!
-              cache.put(event.request, response.clone()).catch(() => {});
-              if (isExplicitOfflineInline || !url.search.includes('skipHtml=1')) {
-                cache.put(canonicalPathKey, response.clone()).catch(() => {});
-              } else if (url.search.includes('skipHtml=1')) {
-                cache.put(canonicalPathKey + '?skipHtml=1', response.clone()).catch(() => {});
-              }
+              // Single clone ONLY (saves 50%+ RAM on 10-12.5MB papers) under canonical path key
+              const singleClone = response.clone();
+              cache.put(cacheKey, singleClone).catch(() => {});
             }
           }
           return response;
-        });
-
-        if (pathMatch) {
-          // Serve cached test paper immediately in 0ms (works 100% offline!).
-          // Only background-refresh if online AND we don't overwrite an inline offline copy with a qimg-stripped version.
-          if (!url.pathname.endsWith('/paper.html') || !pathMatch.headers.get('X-VS-Offline-Inline')) {
-            networkFetch.catch(() => {});
-          }
-          return pathMatch;
-        }
-
-        try {
-          return await networkFetch;
         } catch {
           const fallbackAny =
             (await cache.match(canonicalPathKey)) ||
@@ -243,13 +245,14 @@ self.addEventListener('fetch', (event) => {
     fetch(event.request)
       .then((response) => {
         if (response && response.status === 200 && (response.type === 'basic' || response.type === 'cors')) {
+          const isRootShell = url.pathname === '/' || url.pathname === '/index.html';
           const responseClone = response.clone();
+          const rootClone = isRootShell ? response.clone() : null;
+          const indexClone = isRootShell ? response.clone() : null;
           caches.open(APP_CACHE_NAME).then((cache) => {
             cache.put(event.request, responseClone).catch(() => {});
-            if (url.pathname === '/' || url.pathname === '/index.html') {
-              cache.put(url.origin + '/', response.clone()).catch(() => {});
-              cache.put(url.origin + '/index.html', response.clone()).catch(() => {});
-            }
+            if (rootClone) cache.put(url.origin + '/', rootClone).catch(() => {});
+            if (indexClone) cache.put(url.origin + '/index.html', indexClone).catch(() => {});
           });
         }
         return response;

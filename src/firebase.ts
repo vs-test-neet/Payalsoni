@@ -1,4 +1,4 @@
-import { initializeApp } from '@firebase/app';
+import { initializeApp, onLog } from '@firebase/app';
 import {
   getAuth,
   GoogleAuthProvider,
@@ -56,8 +56,10 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const googleProvider = new GoogleAuthProvider();
 
 const FIRESTORE_QUOTA_COOLDOWN_KEY = 'vs_firestore_quota_cooldown_until_v1';
-const FIRESTORE_QUOTA_COOLDOWN_MS = 60 * 60 * 1000;
+const FIRESTORE_QUOTA_COOLDOWN_MS = 3 * 60 * 60 * 1000;
+const STUDENT_FS_WRITE_THROTTLE_KEY = 'vs_firestore_student_sync_ts_v1';
 let firestoreNetworkDisabledForQuota = false;
+let loggedQuotaPauseWarningThisSession = false;
 
 function readPersistedQuotaCooldown(): number {
   try {
@@ -79,6 +81,76 @@ function pauseFirestoreNetworkForQuota() {
 
 if (firestoreQuotaCooldownUntil > Date.now()) {
   pauseFirestoreNetworkForQuota();
+}
+
+// Intercept internal @firebase/firestore WriteStream/ListenStream `resource-exhausted` & backoff logs.
+// Firestore SDK does not reject pending setDoc/updateDoc promises on quota exhaustion — it retries forever
+// with backoff and spams console.error. Intercepting here halts the retry stream immediately on the 1st hit.
+try {
+  onLog((log) => {
+    const combined = `${log.message || ''} ${(log.args || []).map((a) => String(a ?? '')).join(' ')}`;
+    const lower = combined.toLowerCase();
+    const isQuotaOrBackoff =
+      lower.includes('resource-exhausted') ||
+      lower.includes('quota limit exceeded') ||
+      lower.includes('quota exceeded') ||
+      lower.includes('free daily write units') ||
+      lower.includes('free daily read units') ||
+      lower.includes('using maximum backoff delay');
+
+    if (isQuotaOrBackoff) {
+      firestoreQuotaCooldownUntil = Math.max(
+        firestoreQuotaCooldownUntil,
+        Date.now() + FIRESTORE_QUOTA_COOLDOWN_MS
+      );
+      try {
+        localStorage.setItem(FIRESTORE_QUOTA_COOLDOWN_KEY, String(firestoreQuotaCooldownUntil));
+      } catch {
+        // ignore
+      }
+      pauseFirestoreNetworkForQuota();
+      if (!loggedQuotaPauseWarningThisSession) {
+        loggedQuotaPauseWarningThisSession = true;
+        console.warn(
+          'Firestore free daily quota reached; pausing Firestore network sync and continuing seamlessly via local/Express store.'
+        );
+      }
+      return;
+    }
+
+    if (log.level === 'error') {
+      console.error(`[${log.type}] ${log.message}`, ...(log.args || []));
+    } else if (log.level === 'warn') {
+      console.warn(`[${log.type}] ${log.message}`, ...(log.args || []));
+    }
+  });
+} catch {
+  // ignore if logger hook unavailable
+}
+
+async function runFirestoreWriteGuarded<T>(
+  operation: () => Promise<T>,
+  timeoutMs = 5500
+): Promise<T | null> {
+  if (isFirestoreInQuotaCooldown()) return null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const timeoutPromise = new Promise<'__VS_FS_TIMEOUT__'>((resolve) => {
+      timer = setTimeout(() => resolve('__VS_FS_TIMEOUT__'), timeoutMs);
+    });
+    const result = await Promise.race([operation(), timeoutPromise]);
+    if (result === '__VS_FS_TIMEOUT__') {
+      return null;
+    }
+    return result;
+  } catch (err) {
+    if (noteFirestoreQuotaIfNeeded(err)) {
+      return null;
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function testFirestoreConnection() {
@@ -1001,10 +1073,12 @@ export async function saveFolderToFirestore(folder: TestFolder): Promise<void> {
 
   if (!isFirestoreInQuotaCooldown()) {
     try {
-      await Promise.all([
-        deleteDoc(doc(db, 'folders', `__del__${safeId}`)).catch(() => {}),
-        setDoc(doc(db, 'folders', safeId), buildFirestoreFolderDoc(cleanFolder), { merge: true }),
-      ]);
+      await runFirestoreWriteGuarded(() =>
+        Promise.all([
+          deleteDoc(doc(db, 'folders', `__del__${safeId}`)).catch(() => {}),
+          setDoc(doc(db, 'folders', safeId), buildFirestoreFolderDoc(cleanFolder), { merge: true }),
+        ])
+      );
     } catch (err) {
       if (noteFirestoreQuotaIfNeeded(err)) {
         console.warn('Firestore quota exhausted during folder save; saved via Express/local store.');
@@ -1055,16 +1129,18 @@ export async function deleteFolderFromFirestore(folderId: string): Promise<void>
 
   if (!isFirestoreInQuotaCooldown()) {
     try {
-      await setDoc(doc(db, 'folders', `__del__${safeId}`), {
-        id: `__del__${safeId}`,
-        name: '__DELETED__',
-        description: 'Deleted folder tombstone',
-        createdAt: Date.now(),
-        deletedAt: Date.now(),
-        isDeletedTombstone: true,
-        targetFolderId: safeId,
+      await runFirestoreWriteGuarded(async () => {
+        await setDoc(doc(db, 'folders', `__del__${safeId}`), {
+          id: `__del__${safeId}`,
+          name: '__DELETED__',
+          description: 'Deleted folder tombstone',
+          createdAt: Date.now(),
+          deletedAt: Date.now(),
+          isDeletedTombstone: true,
+          targetFolderId: safeId,
+        });
+        await deleteDoc(doc(db, 'folders', safeId)).catch(() => {});
       });
-      await deleteDoc(doc(db, 'folders', safeId)).catch(() => {});
     } catch (err) {
       if (noteFirestoreQuotaIfNeeded(err)) {
         console.warn('Firestore quota exhausted during folder delete; deleted via Express/local store.');
@@ -1484,9 +1560,13 @@ export async function saveTestToFirestore(
     // During multi-file batch uploads, skip IndexedDB entirely; server is authoritative and syncPortalStore refreshes at batch end
   }
 
-  // 3. Cloud Firestore Persistence (works natively on Vercel CDN AND shares live across AI Studio & Vercel!)
+  // 3. Cloud Firestore Persistence
+  // CRITICAL QUOTA OPTIMIZATION: When running behind Express server (!isStaticStoreHost), Express already stores
+  // multi-MB HTML & question payloads on disk. Uploading 10-12MB HTML chunks to Firestore burns 10,000+ daily write
+  // units in a single upload! Only write compact <2KB metadata (1 write unit) to Firestore when Express is active.
   const saveToCloudFirestore = async () => {
     if (isFirestoreInQuotaCooldown()) return;
+    const shouldUploadHeavyChunksToFirestore = isStaticStoreHost;
     const htmlStr = rawHtml || '';
     const hasQs = compactedQuestions.length > 0;
     const hasHtml = htmlStr.trim().length > 0;
@@ -1495,7 +1575,7 @@ export async function saveTestToFirestore(
     let htmlChunkCount = Number(cleanMeta.htmlChunkCount) || 0;
 
     const qChunkStrings: string[] = [];
-    if (hasQs) {
+    if (shouldUploadHeavyChunksToFirestore && hasQs) {
       let curBatch: CbtQuestion[] = [];
       let curBytes = 2;
       for (const q of compactedQuestions) {
@@ -1516,8 +1596,9 @@ export async function saveTestToFirestore(
       qChunkCount = qChunkStrings.length;
     }
 
-    const htmlSlices = hasHtml ? sliceStringForFirestoreChunks(htmlStr, 680000) : [];
-    if (hasHtml) {
+    const htmlSlices =
+      shouldUploadHeavyChunksToFirestore && hasHtml ? sliceStringForFirestoreChunks(htmlStr, 680000) : [];
+    if (shouldUploadHeavyChunksToFirestore && hasHtml) {
       htmlChunkCount = htmlSlices.length;
     }
 
@@ -1531,10 +1612,15 @@ export async function saveTestToFirestore(
     const writeOps: Array<() => Promise<void>> = [];
     qChunkStrings.forEach((questionsJson, index) => {
       writeOps.push(async () => {
-        await setDoc(doc(db, 'tests', safeId, 'questionChunks', `chunk_${index}`), {
-          index,
-          questionsJson,
-        });
+        if (isFirestoreInQuotaCooldown()) return;
+        await runFirestoreWriteGuarded(
+          () =>
+            setDoc(doc(db, 'tests', safeId, 'questionChunks', `chunk_${index}`), {
+              index,
+              questionsJson,
+            }),
+          8000
+        );
         if (isStaticStoreHost) {
           transferred = Math.min(estTotal, transferred + questionsJson.length);
           options?.onProgress?.(transferred, estTotal);
@@ -1544,10 +1630,15 @@ export async function saveTestToFirestore(
 
     htmlSlices.forEach((htmlPart, index) => {
       writeOps.push(async () => {
-        await setDoc(doc(db, 'tests', safeId, 'htmlChunks', `chunk_${index}`), {
-          index,
-          htmlPart,
-        });
+        if (isFirestoreInQuotaCooldown()) return;
+        await runFirestoreWriteGuarded(
+          () =>
+            setDoc(doc(db, 'tests', safeId, 'htmlChunks', `chunk_${index}`), {
+              index,
+              htmlPart,
+            }),
+          8000
+        );
         if (isStaticStoreHost) {
           transferred = Math.min(estTotal, transferred + htmlPart.length);
           options?.onProgress?.(transferred, estTotal);
@@ -1559,13 +1650,15 @@ export async function saveTestToFirestore(
       const WORKER_COUNT = Math.min(4, writeOps.length);
       let cursor = 0;
       const runWorker = async () => {
-        while (cursor < writeOps.length) {
+        while (cursor < writeOps.length && !isFirestoreInQuotaCooldown()) {
           const i = cursor++;
           await writeOps[i]();
         }
       };
       await Promise.all(Array.from({ length: WORKER_COUNT }, () => runWorker()));
     }
+
+    if (isFirestoreInQuotaCooldown()) return;
 
     const metaWithChunks: CbtTestMeta = {
       ...cleanMeta,
@@ -1574,11 +1667,15 @@ export async function saveTestToFirestore(
     };
 
     if (options?.explicitAdminCreate) {
-      await deleteDoc(doc(db, 'tests', `__del__${safeId}`)).catch(() => {});
+      await runFirestoreWriteGuarded(() =>
+        deleteDoc(doc(db, 'tests', `__del__${safeId}`)).catch(() => {})
+      );
     }
-    await setDoc(doc(db, 'tests', safeId), buildFirestoreTestDoc(metaWithChunks, true), {
-      merge: true,
-    });
+    await runFirestoreWriteGuarded(() =>
+      setDoc(doc(db, 'tests', safeId), buildFirestoreTestDoc(metaWithChunks, true), {
+        merge: true,
+      })
+    );
     if (cachedFirestoreOverlay) {
       cachedFirestoreOverlay.tests = [
         ...cachedFirestoreOverlay.tests.filter((t) => t.id !== safeId),
@@ -2374,38 +2471,44 @@ export async function deleteTestFromFirestore(testId: string): Promise<void> {
   }
 
   try {
-    await setDoc(doc(db, 'tests', `__del__${safeId}`), {
-      id: `__del__${safeId}`,
-      title: '__DELETED__',
-      subject: '__DELETED__',
-      difficulty: 'Easy',
-      totalQuestions: 0,
-      maxMarks: 0,
-      correctMarks: 4,
-      negativeMarks: 1,
-      durationMinutes: 0,
-      openCount: 0,
-      playCount: 0,
-      completionCount: 0,
-      createdAt: Date.now(),
-      deletedAt: Date.now(),
-      isDeletedTombstone: true,
-      targetTestId: safeId,
+    await runFirestoreWriteGuarded(async () => {
+      await setDoc(doc(db, 'tests', `__del__${safeId}`), {
+        id: `__del__${safeId}`,
+        title: '__DELETED__',
+        subject: '__DELETED__',
+        difficulty: 'Easy',
+        totalQuestions: 0,
+        maxMarks: 0,
+        correctMarks: 4,
+        negativeMarks: 1,
+        durationMinutes: 0,
+        openCount: 0,
+        playCount: 0,
+        completionCount: 0,
+        createdAt: Date.now(),
+        deletedAt: Date.now(),
+        isDeletedTombstone: true,
+        targetTestId: safeId,
+      });
+      await deleteDoc(doc(db, 'tests', safeId)).catch(() => {});
     });
-    await deleteDoc(doc(db, 'tests', safeId)).catch(() => {});
 
-    // Clean up subcollection chunks best-effort without letting read quota block deletion
-    try {
-      const [qSnap, htmlSnap] = await Promise.all([
-        getDocs(collection(db, 'tests', safeId, 'questionChunks')),
-        getDocs(collection(db, 'tests', safeId, 'htmlChunks')),
-      ]);
-      await Promise.all([
-        ...qSnap.docs.map((d) => deleteDoc(d.ref).catch(() => {})),
-        ...htmlSnap.docs.map((d) => deleteDoc(d.ref).catch(() => {})),
-      ]);
-    } catch (chunkErr) {
-      noteFirestoreQuotaIfNeeded(chunkErr);
+    // Clean up subcollection chunks best-effort only when on static host (Express doesn't upload chunks)
+    if (isStaticStoreHost && !isFirestoreInQuotaCooldown()) {
+      try {
+        const [qSnap, htmlSnap] = await Promise.all([
+          getDocs(collection(db, 'tests', safeId, 'questionChunks')),
+          getDocs(collection(db, 'tests', safeId, 'htmlChunks')),
+        ]);
+        await runFirestoreWriteGuarded(() =>
+          Promise.all([
+            ...qSnap.docs.map((d) => deleteDoc(d.ref).catch(() => {})),
+            ...htmlSnap.docs.map((d) => deleteDoc(d.ref).catch(() => {})),
+          ])
+        );
+      } catch (chunkErr) {
+        noteFirestoreQuotaIfNeeded(chunkErr);
+      }
     }
   } catch (err) {
     if (noteFirestoreQuotaIfNeeded(err)) {
@@ -2593,10 +2696,12 @@ export async function incrementTestEngagement(
   if (!expressEngaged && !isFirestoreInQuotaCooldown()) {
     try {
       const testRef = doc(db, 'tests', safeId);
-      await updateDoc(testRef, {
-        [field]: increment(1),
-        lastPlayedAt: Date.now(),
-      });
+      await runFirestoreWriteGuarded(() =>
+        updateDoc(testRef, {
+          [field]: increment(1),
+          lastPlayedAt: Date.now(),
+        })
+      );
     } catch (err) {
       noteFirestoreQuotaIfNeeded(err);
     }
@@ -2650,7 +2755,7 @@ export async function deleteAttemptFromFirestore(attemptId: string): Promise<voi
 
   if (!isFirestoreInQuotaCooldown()) {
     try {
-      await deleteDoc(doc(db, 'attempts', safeAttId));
+      await runFirestoreWriteGuarded(() => deleteDoc(doc(db, 'attempts', safeAttId)));
     } catch (err) {
       noteFirestoreQuotaIfNeeded(err);
     }
@@ -2709,16 +2814,20 @@ export async function recordTestCompletion(
 
   if (!isFirestoreInQuotaCooldown()) {
     try {
-      await setDoc(doc(db, 'attempts', attemptId), stripUndefined(cleanAttempt));
-      const safeTestId = String(attempt.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
-      if (safeTestId) {
-        const testRef = doc(db, 'tests', safeTestId);
-        await updateDoc(testRef, {
-          completionCount: increment(1),
-          totalScoreSum: increment(Math.max(0, Number(attempt.score) || 0)),
-          highScore: Math.max(Number(_currentHighScore) || 0, Number(attempt.score) || 0),
-        });
-      }
+      await runFirestoreWriteGuarded(async () => {
+        await setDoc(doc(db, 'attempts', attemptId), stripUndefined(cleanAttempt));
+        if (isStaticStoreHost) {
+          const safeTestId = String(attempt.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+          if (safeTestId) {
+            const testRef = doc(db, 'tests', safeTestId);
+            await updateDoc(testRef, {
+              completionCount: increment(1),
+              totalScoreSum: increment(Math.max(0, Number(attempt.score) || 0)),
+              highScore: Math.max(Number(_currentHighScore) || 0, Number(attempt.score) || 0),
+            });
+          }
+        }
+      });
     } catch (err) {
       noteFirestoreQuotaIfNeeded(err);
     }
@@ -2869,13 +2978,40 @@ export async function saveStudentToFirestore(
     }
   }
 
-  // Always dual-write student accounts to Cloud Firestore as well (when not in quota cooldown)
-  // so Admin sees every student across deployments, restarts, and devices.
+  // Dual-write student accounts to Cloud Firestore (throttled for routine repeat logins when Express already saved
+  // to preserve daily free write quota while still syncing every new registration immediately).
   if (!isFirestoreInQuotaCooldown()) {
-    try {
-      await setDoc(doc(db, 'students', safeId), stripUndefined(payload), { merge: true });
-    } catch (err) {
-      noteFirestoreQuotaIfNeeded(err);
+    let shouldMirrorStudentToFirestore = isNewRegistration || isStaticStoreHost;
+    if (!shouldMirrorStudentToFirestore) {
+      try {
+        const rawMap = localStorage.getItem(STUDENT_FS_WRITE_THROTTLE_KEY);
+        const tsMap: Record<string, number> = rawMap ? JSON.parse(rawMap) : {};
+        const lastSyncedAt = Number(tsMap[safeId] || 0);
+        if (Date.now() - lastSyncedAt > 6 * 60 * 60 * 1000) {
+          shouldMirrorStudentToFirestore = true;
+        }
+      } catch {
+        shouldMirrorStudentToFirestore = true;
+      }
+    }
+    if (shouldMirrorStudentToFirestore) {
+      try {
+        const res = await runFirestoreWriteGuarded(() =>
+          setDoc(doc(db, 'students', safeId), stripUndefined(payload), { merge: true })
+        );
+        if (res !== null) {
+          try {
+            const rawMap = localStorage.getItem(STUDENT_FS_WRITE_THROTTLE_KEY);
+            const tsMap: Record<string, number> = rawMap ? JSON.parse(rawMap) : {};
+            tsMap[safeId] = Date.now();
+            localStorage.setItem(STUDENT_FS_WRITE_THROTTLE_KEY, JSON.stringify(tsMap));
+          } catch {
+            // ignore
+          }
+        }
+      } catch (err) {
+        noteFirestoreQuotaIfNeeded(err);
+      }
     }
   }
 
@@ -2939,7 +3075,7 @@ export async function deleteStudentFromFirestore(studentId: string): Promise<voi
 
   if (!isFirestoreInQuotaCooldown()) {
     try {
-      await deleteDoc(doc(db, 'students', safeId));
+      await runFirestoreWriteGuarded(() => deleteDoc(doc(db, 'students', safeId)));
     } catch (err) {
       noteFirestoreQuotaIfNeeded(err);
     }

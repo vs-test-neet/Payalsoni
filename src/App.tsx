@@ -2038,7 +2038,7 @@ function AppContent() {
       offlineAbortRef.current = controller;
       void downloadTestsBatchOffline(tests, {
         signal: controller.signal,
-        delayMsBetweenTests: 450,
+        delayMsBetweenTests: 1200,
         onProgress: (prog, updatedIds) => {
           setOfflineCachedIds(updatedIds);
           setOfflineBatchProgress(prog);
@@ -2048,7 +2048,7 @@ function AppContent() {
           offlineAbortRef.current = null;
         }
       });
-    }, 3500);
+    }, 8000);
 
     return () => window.clearTimeout(timer);
   }, [isOnline, tests, activeRunningTest]);
@@ -2972,6 +2972,13 @@ function AppContent() {
               String(qs[0]?.questionEn || qs[0]?.questionHi || '').trim()
             ))
       );
+
+    // Immediately abort any background offline caching BEFORE mounting the exam iframe so the test gets 100% network & CPU
+    if (offlineAbortRef.current) {
+      offlineAbortRef.current.abort();
+      offlineAbortRef.current = null;
+      setOfflineBatchProgress((prev) => ({ ...prev, active: false, currentTitle: '' }));
+    }
 
     // INSTANT 0ms LAUNCH PATH for all HTML tests — never block on 'Opening Test Paper...' modal!
     if (preferHtml) {

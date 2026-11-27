@@ -1186,6 +1186,9 @@ async function startServer() {
   ): string {
     const trimmed = String(sourceHtml || '').trim();
     if (!trimmed) return '';
+    if (trimmed.includes('VS_CBT_HTML_BRIDGE_READY') && trimmed.includes('__vsOnHtmlAnalysisResult')) {
+      return trimmed;
+    }
 
     // 1. Strip Cloudflare challenge/beacon scripts in head or tail without scanning 10MB base64 blocks unnecessarily
     const tailOffset = Math.max(0, trimmed.length - 8192);
@@ -1301,19 +1304,21 @@ async function startServer() {
 })();
 </script>`;
 
-    baseHtml = baseHtml
-      .replace(
-        /const\s+res\s*=\s*computeResults\s*\(([^)]*)\)\s*;/g,
-        'const res = computeResults($1); try { if (typeof window.__vsOnHtmlAnalysisResult === "function") window.__vsOnHtmlAnalysisResult(res); } catch(e) {}'
-      )
-      .replace(
-        /const\s+r\s*=\s*cR\s*\(([^)]*)\)\s*,/g,
-        'const r=cR($1),__vsHook=(typeof window.__vsOnHtmlAnalysisResult==="function"?(window.__vsOnHtmlAnalysisResult(r),1):0),'
-      )
-      .replace(
-        /buildAnalysis\s*\(\s*\)\s*;\s*showAnalysis\s*\(\s*\)\s*;/g,
-        'buildAnalysis(); showAnalysis(); try { if (typeof window.__vsNotifySubmitted === "function") window.__vsNotifySubmitted(); } catch(e) {}'
-      );
+    if (!baseHtml.includes('__vsOnHtmlAnalysisResult')) {
+      baseHtml = baseHtml
+        .replace(
+          /const\s+res\s*=\s*computeResults\s*\(([^)]*)\)\s*;/g,
+          'const res = computeResults($1); try { if (typeof window.__vsOnHtmlAnalysisResult === "function") window.__vsOnHtmlAnalysisResult(res); } catch(e) {}'
+        )
+        .replace(
+          /const\s+r\s*=\s*cR\s*\(([^)]*)\)\s*,/g,
+          'const r=cR($1),__vsHook=(typeof window.__vsOnHtmlAnalysisResult==="function"?(window.__vsOnHtmlAnalysisResult(r),1):0),'
+        )
+        .replace(
+          /buildAnalysis\s*\(\s*\)\s*;\s*showAnalysis\s*\(\s*\)\s*;/g,
+          'buildAnalysis(); showAnalysis(); try { if (typeof window.__vsNotifySubmitted === "function") window.__vsNotifySubmitted(); } catch(e) {}'
+        );
+    }
 
     const headMatch = /<head[^>]*>/i.exec(baseHtml);
     if (headMatch && typeof headMatch.index === 'number') {
@@ -1842,6 +1847,42 @@ async function startServer() {
 
   // Zero-RAM direct streaming HTML endpoint for 100% crash-free opening of ANY size or format HTML test
   const patchedPaperCache = new Map<string, { version: number; gz: Buffer; rawLen: number }>();
+
+  // Ultra-fast <1ms HEAD route so iframe readiness checks NEVER trigger a 12MB decompression/gzip pass
+  app.head('/api/store/test/:testId/paper.html', (req, res) => {
+    ensureDataDirs();
+    res.setHeader('X-VS-Express-Store', '1');
+    const rawId = String(req.params.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const targetMeta = (memoryStore.tests.find((t) => String(t.id) === rawId) || {}) as Record<string, unknown>;
+    const assetRel =
+      rawId === 'prayas_06'
+        ? 'assets/aistudio/Vs_PRAYAS_Minor_Test_06__02_11_2026__NEET_CBT_Test_e42702d3.html'
+        : typeof targetMeta.assetUrl === 'string' && targetMeta.assetUrl.startsWith('/assets/')
+          ? targetMeta.assetUrl.slice(1)
+          : '';
+    const hasAsset =
+      Boolean(assetRel) &&
+      (fs.existsSync(path.join(__dirname, 'public', assetRel)) ||
+        fs.existsSync(path.join(__dirname, 'dist', assetRel)));
+    const publicStaticDir = path.join(__dirname, 'public', 'static-store');
+    const hasDiskFile =
+      hasAsset ||
+      patchedPaperCache.has(rawId) ||
+      fs.existsSync(path.join(TESTS_DIR, `${rawId}.bin`)) ||
+      fs.existsSync(path.join(TESTS_DIR, `${rawId}.json.gz`)) ||
+      fs.existsSync(path.join(TESTS_DIR, `${rawId}.json`)) ||
+      fs.existsSync(path.join(publicStaticDir, 'paper', `${rawId}.html`)) ||
+      fs.existsSync(path.join(publicStaticDir, 'test', `${rawId}.json`));
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    if (hasDiskFile) {
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.status(200).end();
+    } else {
+      res.setHeader('Cache-Control', 'no-store');
+      res.status(404).end();
+    }
+  });
 
   app.get('/api/store/test/:testId/paper.html', async (req, res) => {
     ensureDataDirs();

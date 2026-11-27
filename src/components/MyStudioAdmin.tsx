@@ -4607,10 +4607,10 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
                 <AlertCircle className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
                 <div>
                   <div className="font-extrabold">
-                    Cloud Database Free Daily Read Quota Exhausted (Firestore Free Limit)
+                    Cloud Database Free Daily Quota Reached (Firestore Free Tier Limit)
                   </div>
                   <p className="text-xs opacity-90 mt-0.5">
-                    Abhi sirf local server par saved students ({unifiedStudentsWithAttempts.length}) dikh rahe hain kyunki Firebase Firestore ka aaj ka free daily read quota khatam ho gaya hai. Kal quota reset hote hi (ya Firebase upgrade ke baad) <strong>Sync All Students</strong> dabane par saare cloud students automatically aa jayenge aur permanent backup ho jayenge.
+                    Abhi server par saved students ({unifiedStudentsWithAttempts.length}) smoothly work kar rahe hain, lekin Firebase Firestore ka aaj ka free daily read/write quota khatam ho gaya hai. Kal quota reset hote hi (ya Firebase plan upgrade ke baad) <strong>Sync All Students</strong> dabane par cloud sync dubara shuru ho jayega.
                   </p>
                 </div>
               </div>

@@ -125,9 +125,10 @@ export async function getCachedOfflineTestIds(tests: CbtTestMeta[]): Promise<Set
         }
       }
 
-      const appCache = await caches.open('vs-test-app-v13');
+      const appCache = await caches.open('vs-test-app-v14');
       const prayasCached = Boolean(
         (await appCache.match('/assets/aistudio/Vs_PRAYAS_Minor_Test_06__02_11_2026__NEET_CBT_Test_e42702d3.html')) ||
+          (await caches.match('/assets/aistudio/Vs_PRAYAS_Minor_Test_06__02_11_2026__NEET_CBT_Test_e42702d3.html')) ||
           (await cache.match('/api/store/test/prayas_06/paper.html'))
       );
       if (prayasCached) {

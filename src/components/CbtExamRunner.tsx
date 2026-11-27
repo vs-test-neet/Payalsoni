@@ -291,6 +291,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
 
   const [localFallbackHtml, setLocalFallbackHtml] = useState<string>('');
   const [serverStreamFailed, setServerStreamFailed] = useState<boolean>(false);
+  const [isLoadingFallbackHtml, setIsLoadingFallbackHtml] = useState<boolean>(false);
   const [missingPaperNotice, setMissingPaperNotice] = useState<boolean>(false);
   const activeRawHtml = localFallbackHtml || rawHtmlContent;
 
@@ -1845,61 +1846,67 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
   }, []);
 
   const triggerLocalHtmlFallback = useCallback(async () => {
+    setHtmlBridgeReady(false);
+    setIsLoadingFallbackHtml(true);
     setServerStreamFailed(true);
-    // 1. Check Service Worker Cache Storage directly first (works 100% offline in ~5ms even if iframe stream errored!)
     try {
-      const swCachedHtml = await readCachedTestHtmlFromSwCache(testMeta.id);
-      if (swCachedHtml && swCachedHtml.trim().length > 200) {
-        setMissingPaperNotice(false);
-        setLocalFallbackHtml(swCachedHtml);
-        return;
-      }
-    } catch {
-      // ignore
-    }
-    try {
-      const bundle = await loadTestBundleFromFirestore(testMeta.id);
-      if (bundle.rawHtml && bundle.rawHtml.trim().length > 20) {
-        setMissingPaperNotice(false);
-        setLocalFallbackHtml(bundle.rawHtml);
-        return;
-      }
-      if (hasRealPlayableQuestions(bundle.questions)) {
-        setMissingPaperNotice(false);
-        setLocalFallbackHtml(buildStandaloneCbtHtmlFromQuestions(testMeta, bundle.questions));
-        return;
-      }
-    } catch {
-      // ignore
-    }
-    if (hasRealPlayableQuestions(questions)) {
-      setMissingPaperNotice(false);
-      setLocalFallbackHtml(buildStandaloneCbtHtmlFromQuestions(testMeta, questions));
-      return;
-    }
-    const isPrayas06 =
-      testMeta.id === 'prayas_06' ||
-      (typeof testMeta.assetUrl === 'string' &&
-        testMeta.assetUrl.includes('Vs_PRAYAS_Minor_Test_06'));
-    if (isPrayas06) {
+      // 1. Check Service Worker Cache Storage directly first (works 100% offline in ~5ms even if iframe stream errored!)
       try {
-        const assetRes = await fetch(
-          '/assets/aistudio/Vs_PRAYAS_Minor_Test_06__02_11_2026__NEET_CBT_Test_e42702d3.html'
-        );
-        if (assetRes.ok) {
-          const assetHtml = await assetRes.text();
-          if (assetHtml && assetHtml.trim().length > 100) {
-            setMissingPaperNotice(false);
-            setLocalFallbackHtml(assetHtml);
-            return;
-          }
+        const swCachedHtml = await readCachedTestHtmlFromSwCache(testMeta.id);
+        if (swCachedHtml && swCachedHtml.trim().length > 200) {
+          setMissingPaperNotice(false);
+          setLocalFallbackHtml(swCachedHtml);
+          return;
         }
       } catch {
         // ignore
       }
+      try {
+        const bundle = await loadTestBundleFromFirestore(testMeta.id);
+        if (bundle.rawHtml && bundle.rawHtml.trim().length > 20) {
+          setMissingPaperNotice(false);
+          setLocalFallbackHtml(bundle.rawHtml);
+          return;
+        }
+        if (hasRealPlayableQuestions(bundle.questions)) {
+          setMissingPaperNotice(false);
+          setLocalFallbackHtml(buildStandaloneCbtHtmlFromQuestions(testMeta, bundle.questions));
+          return;
+        }
+      } catch {
+        // ignore
+      }
+      if (hasRealPlayableQuestions(questions)) {
+        setMissingPaperNotice(false);
+        setLocalFallbackHtml(buildStandaloneCbtHtmlFromQuestions(testMeta, questions));
+        return;
+      }
+      const isPrayas06 =
+        testMeta.id === 'prayas_06' ||
+        (typeof testMeta.assetUrl === 'string' &&
+          testMeta.assetUrl.includes('Vs_PRAYAS_Minor_Test_06'));
+      if (isPrayas06) {
+        try {
+          const assetRes = await fetch(
+            '/assets/aistudio/Vs_PRAYAS_Minor_Test_06__02_11_2026__NEET_CBT_Test_e42702d3.html'
+          );
+          if (assetRes.ok) {
+            const assetHtml = await assetRes.text();
+            if (assetHtml && assetHtml.trim().length > 100) {
+              setMissingPaperNotice(false);
+              setLocalFallbackHtml(assetHtml);
+              return;
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+      setMissingPaperNotice(true);
+      setExactHtmlMode(false);
+    } finally {
+      setIsLoadingFallbackHtml(false);
     }
-    setMissingPaperNotice(true);
-    setExactHtmlMode(false);
   }, [testMeta, questions, hasRealPlayableQuestions]);
 
   // Mount the direct paper stream URL in 0ms (NO redundant HEAD/GET pre-flight delay!).
@@ -1911,16 +1918,21 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     }
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       let cancelled = false;
-      void readCachedTestHtmlFromSwCache(testMeta.id).then((cachedHtml) => {
-        if (cancelled) return;
-        if (cachedHtml && cachedHtml.trim().length > 200) {
-          setServerStreamFailed(true);
-          setMissingPaperNotice(false);
-          setLocalFallbackHtml(cachedHtml);
-        } else {
-          setVerifiedStreamUrl(serverHtmlPaperUrl);
-        }
-      });
+      setIsLoadingFallbackHtml(true);
+      void readCachedTestHtmlFromSwCache(testMeta.id)
+        .then((cachedHtml) => {
+          if (cancelled) return;
+          if (cachedHtml && cachedHtml.trim().length > 200) {
+            setServerStreamFailed(true);
+            setMissingPaperNotice(false);
+            setLocalFallbackHtml(cachedHtml);
+          } else {
+            setVerifiedStreamUrl(serverHtmlPaperUrl);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setIsLoadingFallbackHtml(false);
+        });
       return () => {
         cancelled = true;
       };
@@ -1928,9 +1940,10 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     setVerifiedStreamUrl(serverHtmlPaperUrl);
   }, [serverHtmlPaperUrl, testMeta.id]);
 
-  // Safety guard: if a brand-new Firestore test isn't in static /static-store/paper/ yet, auto-load from Cache/Vault/Firestore
+  // Safety guard: if a brand-new Firestore test isn't in static /static-store/paper/ yet, auto-load from Cache/Vault/Firestore.
+  // Uses a generous 6.5s timeout so large 9-12.5MB papers downloading on mobile are NEVER aborted mid-stream!
   useEffect(() => {
-    if (!verifiedStreamUrl || htmlBridgeReady || !exactHtmlMode || isSubmitted) return;
+    if (!verifiedStreamUrl || htmlBridgeReady || !exactHtmlMode || isSubmitted || isLoadingFallbackHtml) return;
     let cancelled = false;
     const isOfflineNow = typeof navigator !== 'undefined' && !navigator.onLine;
     const guardTimer = window.setTimeout(() => {
@@ -1949,12 +1962,12 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
         .catch(() => {
           if (!cancelled) void triggerLocalHtmlFallback();
         });
-    }, isOfflineNow ? 2600 : 1800);
+    }, isOfflineNow ? 2600 : 6500);
     return () => {
       cancelled = true;
       window.clearTimeout(guardTimer);
     };
-  }, [verifiedStreamUrl, htmlBridgeReady, exactHtmlMode, isSubmitted, triggerLocalHtmlFallback]);
+  }, [verifiedStreamUrl, htmlBridgeReady, exactHtmlMode, isSubmitted, isLoadingFallbackHtml, triggerLocalHtmlFallback]);
 
   // Build full-screen native HTML test document ONLY when not streaming directly from server /paper.html
   // Handles ANY partial, legacy, or full HTML structure safely without blocking alert/open or stale storage.
@@ -1962,10 +1975,24 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     if (!exactHtmlMode || isSubmitted || serverHtmlPaperUrl) return '';
     const trimmedRaw = (activeRawHtml || '').trim();
 
+    // If this HTML was already patched by server /paper.html (e.g. read from Offline Cache Storage),
+    // return it directly! Re-patching would double-inject `__vsHook` and cause a fatal JS SyntaxError (white screen).
+    if (
+      trimmedRaw.length > 200 &&
+      trimmedRaw.includes('VS_CBT_HTML_BRIDGE_READY') &&
+      trimmedRaw.includes('__vsOnHtmlAnalysisResult')
+    ) {
+      return trimmedRaw;
+    }
+
     const sourceHtml =
       trimmedRaw.length > 20
         ? trimmedRaw
-        : buildStandaloneCbtHtmlFromQuestions(testMeta, questions);
+        : isLoadingFallbackHtml
+          ? ''
+          : buildStandaloneCbtHtmlFromQuestions(testMeta, questions);
+
+    if (!sourceHtml) return '';
 
     // Strip trailing Cloudflare challenge/beacon scripts cleanly without scanning 12MB middle segments
     const tailOffset = Math.max(0, sourceHtml.length - 8192);
@@ -2086,19 +2113,21 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
 
     // Hook into modern uploaded HTML tests (`computeResults(...)` inside `renderAnalysisDashboard` AND `buildAnalysis()` in AIATS)
     // so wrong answers, bookmarked questions, and final scores are 100% captured even inside IIFE closures!
-    baseHtml = baseHtml
-      .replace(
-        /const\s+res\s*=\s*computeResults\s*\(([^)]*)\)\s*;/g,
-        'const res = computeResults($1); try { if (typeof window.__vsOnHtmlAnalysisResult === "function") window.__vsOnHtmlAnalysisResult(res); } catch(e) {}'
-      )
-      .replace(
-        /const\s+r\s*=\s*cR\s*\(([^)]*)\)\s*,/g,
-        'const r=cR($1),__vsHook=(typeof window.__vsOnHtmlAnalysisResult==="function"?(window.__vsOnHtmlAnalysisResult(r),1):0),'
-      )
-      .replace(
-        /buildAnalysis\s*\(\s*\)\s*;\s*showAnalysis\s*\(\s*\)\s*;/g,
-        'buildAnalysis(); showAnalysis(); try { if (typeof window.__vsNotifySubmitted === "function") window.__vsNotifySubmitted(); } catch(e) {}'
-      );
+    if (!baseHtml.includes('__vsOnHtmlAnalysisResult')) {
+      baseHtml = baseHtml
+        .replace(
+          /const\s+res\s*=\s*computeResults\s*\(([^)]*)\)\s*;/g,
+          'const res = computeResults($1); try { if (typeof window.__vsOnHtmlAnalysisResult === "function") window.__vsOnHtmlAnalysisResult(res); } catch(e) {}'
+        )
+        .replace(
+          /const\s+r\s*=\s*cR\s*\(([^)]*)\)\s*,/g,
+          'const r=cR($1),__vsHook=(typeof window.__vsOnHtmlAnalysisResult==="function"?(window.__vsOnHtmlAnalysisResult(r),1):0),'
+        )
+        .replace(
+          /buildAnalysis\s*\(\s*\)\s*;\s*showAnalysis\s*\(\s*\)\s*;/g,
+          'buildAnalysis(); showAnalysis(); try { if (typeof window.__vsNotifySubmitted === "function") window.__vsNotifySubmitted(); } catch(e) {}'
+        );
+    }
 
     const headMatch = /<head[^>]*>/i.exec(baseHtml);
     if (headMatch && typeof headMatch.index === 'number') {
@@ -2468,7 +2497,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     }
     return `${baseHtml}${bridgeScript}`;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [exactHtmlMode, isSubmitted, serverHtmlPaperUrl, activeRawHtml, testMeta.id]);
+  }, [exactHtmlMode, isSubmitted, serverHtmlPaperUrl, activeRawHtml, isLoadingFallbackHtml, testMeta.id]);
 
   // Create a fast same-origin Blob URL for large HTML papers so 12.6MB strings never choke iframe srcDoc
   const htmlBlobUrl = useMemo(() => {
@@ -2793,14 +2822,45 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     testMeta.title,
   ]);
 
-  if (exactHtmlMode && !isSubmitted && (serverHtmlPaperUrl || effectiveHtmlDoc)) {
+  if (exactHtmlMode && !isSubmitted && (serverHtmlPaperUrl || effectiveHtmlDoc || isLoadingFallbackHtml)) {
     const activeIframeSrc = verifiedStreamUrl || htmlBlobUrl || undefined;
     const activeIframeSrcDoc = activeIframeSrc ? undefined : effectiveHtmlDoc || undefined;
+    const showLoadingOverlay = !htmlBridgeReady || isLoadingFallbackHtml || (!activeIframeSrc && !activeIframeSrcDoc);
     return (
       <div className="fixed inset-0 z-50 w-full h-dvh flex flex-col bg-[#effaff] overflow-hidden">
         {renderShareScorecardModal()}
         {renderPdfGeneratingOverlay()}
-        {!htmlBridgeReady && showHtmlFallbackExit && (
+        {showLoadingOverlay && (
+          <div className="absolute inset-0 z-[58] flex flex-col items-center justify-center gap-4 px-5 bg-gradient-to-br from-[#effaff] via-[#f7fcff] to-[#e4f4ff] text-sky-950">
+            <div className="w-full max-w-sm rounded-3xl bg-white/90 backdrop-blur-md border border-sky-200/80 shadow-xl px-6 py-7 flex flex-col items-center text-center gap-3.5">
+              <div className="w-12 h-12 rounded-2xl bg-sky-500/12 border border-sky-400/30 flex items-center justify-center">
+                <Loader2 className="w-6 h-6 text-sky-600 animate-spin" />
+              </div>
+              <div className="space-y-1">
+                <div className="text-xs font-extrabold uppercase tracking-wider text-sky-600">
+                  Opening CBT Test Paper...
+                </div>
+                <h3 className="text-base sm:text-lg font-black text-slate-900 line-clamp-2">
+                  {testMeta.title}
+                </h3>
+                <p className="text-xs text-slate-600 font-medium">
+                  HD diagrams &amp; questions load ho rahe hain — bas kuch seconds...
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  persistInProgressSnapshot();
+                  onExit();
+                }}
+                className="mt-1 px-4 py-2 rounded-xl bg-sky-50 hover:bg-sky-100 text-sky-900 border border-sky-300 text-xs font-extrabold cursor-pointer transition"
+              >
+                ← Back to Home
+              </button>
+            </div>
+          </div>
+        )}
+        {!htmlBridgeReady && showHtmlFallbackExit && !showLoadingOverlay && (
           <div className="fixed top-2.5 left-2.5 right-2.5 z-[60] flex items-center justify-start gap-2 pointer-events-none">
             <button
               type="button"
@@ -2840,24 +2900,38 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
             </button>
           </div>
         )}
-        {activeIframeSrc || activeIframeSrcDoc ? (
+        {(activeIframeSrc || activeIframeSrcDoc) && (
           <iframe
+            key={activeIframeSrc || 'srcdoc-paper'}
             src={activeIframeSrc}
             srcDoc={activeIframeSrcDoc}
-            onLoad={() => setHtmlBridgeReady(true)}
+            onLoad={(ev) => {
+              // Avoid revealing an iframe that only loaded a 404/503 fallback trigger stub
+              try {
+                const bodyText = ev.currentTarget?.contentDocument?.body?.innerText || '';
+                if (
+                  bodyText.includes('Test paper loading fallback') ||
+                  bodyText.includes('Checking saved test on device')
+                ) {
+                  return;
+                }
+              } catch {
+                // cross-origin or restricted access — safe to proceed
+              }
+              window.requestAnimationFrame(() => {
+                setHtmlBridgeReady(true);
+              });
+            }}
             onError={() => {
               if (serverHtmlPaperUrl) {
                 void triggerLocalHtmlFallback();
               }
             }}
             title={testMeta.title}
-            className="w-full flex-1 h-full border-0 bg-white"
+            className={`w-full flex-1 h-full border-0 bg-[#effaff] transition-opacity duration-150 ${
+              showLoadingOverlay ? 'opacity-0' : 'opacity-100'
+            }`}
           />
-        ) : (
-          <div className="w-full flex-1 flex flex-col items-center justify-center gap-3 bg-[#effaff] text-sky-900">
-            <Loader2 className="w-8 h-8 text-sky-600 animate-spin" />
-            <div className="text-sm font-extrabold">Loading Test Paper...</div>
-          </div>
         )}
       </div>
     );
