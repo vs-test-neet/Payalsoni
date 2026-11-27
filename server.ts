@@ -6,6 +6,7 @@ import zlib from 'zlib';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import nodemailer from 'nodemailer';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 
 const gzipAsync = promisify(zlib.gzip);
@@ -126,69 +127,33 @@ const DUPLICATE_TEST_FILE_ALIASES: Record<string, string> = {
   test_mwc4heg5: 'test_mwdrmtnf_0_v02j',
 };
 
-const CURATED_FALLBACK_SPECS: Record<
-  string,
-  { subjectLabel: string; slices: Array<{ sourceId: string; start: number; count: number }> }
-> = {
-  test_mwdhvcaq_0_eafm: {
-    subjectLabel: 'Biology',
-    slices: [{ sourceId: 'test_mwdrmtnf_0_v02j', start: 90, count: 90 }],
-  },
-  test_mwdhvobl_1_0qjb: {
-    subjectLabel: 'Biology',
-    slices: [{ sourceId: 'test_mwdrn6mc_2_lqi5', start: 90, count: 90 }],
-  },
-  test_mwdhw157_2_27vi: {
-    subjectLabel: 'Biology',
-    slices: [{ sourceId: 'test_mwdrnias_3_z7eb', start: 90, count: 90 }],
-  },
-  test_mwdhwiv3_4_an2y: {
-    subjectLabel: 'Biology',
-    slices: [{ sourceId: 'test_mwdrnnt6_4_3yea', start: 90, count: 90 }],
-  },
-  test_mwdhwth6_5_twu2: {
-    subjectLabel: 'Biology',
-    slices: [{ sourceId: 'test_mwdrnqhm_5_qmui', start: 90, count: 90 }],
-  },
-  test_mwdhx1l7_6_azuh: {
-    subjectLabel: 'Biology',
-    slices: [{ sourceId: 'test_mwdrnte7_6_cs4x', start: 90, count: 90 }],
-  },
-  test_mwev95mh: {
-    subjectLabel: 'Biology',
-    slices: [{ sourceId: 'test_mwdt74ve', start: 90, count: 90 }],
-  },
-  sarvam_prayas_minor_07_physics_20261105_mwhwucn1: {
-    subjectLabel: 'Physics',
-    slices: [
-      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 10, count: 35 },
-      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 0, count: 10 },
-    ],
-  },
-  neet_botany_387_video_v3_mwhxg7oh: {
-    subjectLabel: 'Botany',
-    slices: [
-      { sourceId: 'test_mwdt8hkm_0_b25g', start: 90, count: 45 },
-      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 90, count: 45 },
-      { sourceId: 'test_mwdt8qzq_2_du0l', start: 90, count: 45 },
-      { sourceId: 'test_mwdt8wxc_3_lz0e', start: 90, count: 45 },
-      { sourceId: 'test_mwdt95jd_5_u9p0', start: 90, count: 45 },
-      { sourceId: 'test_mwdt9cn6_6_dsz2', start: 90, count: 45 },
-      { sourceId: 'test_mwdrmwl7_1_xbuf', start: 90, count: 90 },
-      { sourceId: 'test_mwdrf1ga_2_kzkl', start: 0, count: 27 },
-    ],
-  },
-  test_mwf3a4c1: {
-    subjectLabel: 'Full Syllabus',
-    slices: [
-      { sourceId: 'test_mwdrnnt6_4_3yea', start: 5, count: 40 },
-      { sourceId: 'test_mwdrnnt6_4_3yea', start: 0, count: 5 },
-      { sourceId: 'test_mwdrnqhm_5_qmui', start: 45, count: 45 },
-      { sourceId: 'test_mwdt8hkm_0_b25g', start: 135, count: 45 },
-      { sourceId: 'test_mwdt8k7h_1_j9x0', start: 135, count: 45 },
-    ],
-  },
-};
+function hasPlayableLocalPaper(testObj: Record<string, unknown>): boolean {
+  if (!testObj || !testObj.id) return false;
+  if (testObj.isPdfOnly) return true;
+  const rawId = String(testObj.id).replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (rawId === 'prayas_06') return true;
+  if (typeof testObj.assetUrl === 'string' && testObj.assetUrl.startsWith('/assets/')) {
+    const rel = testObj.assetUrl.slice(1);
+    if (
+      fs.existsSync(path.join(__dirname, 'public', rel)) ||
+      fs.existsSync(path.join(__dirname, 'dist', rel))
+    ) {
+      return true;
+    }
+  }
+  const safeId = DUPLICATE_TEST_FILE_ALIASES[rawId] || rawId;
+  for (const ext of ['bin', 'json']) {
+    const p = path.join(TESTS_DIR, `${safeId}.${ext}`);
+    try {
+      if (fs.existsSync(p) && fs.statSync(p).size > 4096) {
+        return true;
+      }
+    } catch {
+      // ignore stat errors
+    }
+  }
+  return false;
+}
 
 function hasMeaningfulQuestionText(q: Record<string, unknown>): boolean {
   const en = typeof q.questionEn === 'string' ? q.questionEn.trim() : '';
@@ -584,7 +549,7 @@ function initializeMemoryStore() {
       }
     }
 
-    // Propagate folder-level Syllabus PDF across tests inside the same folder (without altering any test/folder name or banner)
+    // Only propagate explicit folder-level Syllabus PDFs down to tests inside that folder (never copy one test's PDF onto sibling tests)
     const folderPdfMap = new Map<string, { id: string; name: string }>();
     for (const f of memoryStore.folders) {
       const fId = String(f.id || '');
@@ -596,23 +561,7 @@ function initializeMemoryStore() {
         });
       }
     }
-    for (const t of memoryStore.tests) {
-      const fId = String(t.folderId || '');
-      const pdfId = typeof t.attachmentPdfId === 'string' ? t.attachmentPdfId : '';
-      if (fId && pdfId && !folderPdfMap.has(fId) && fs.existsSync(path.join(PDFS_DIR, `${pdfId}.pdf`))) {
-        folderPdfMap.set(fId, {
-          id: pdfId,
-          name: String(t.attachmentPdfName || t.title || 'Syllabus.pdf'),
-        });
-      }
-    }
     for (const [fId, pdfInfo] of folderPdfMap.entries()) {
-      const folderObj = memoryStore.folders.find((f) => String(f.id) === fId);
-      if (folderObj && !folderObj.attachmentPdfId) {
-        folderObj.attachmentPdfId = pdfInfo.id;
-        folderObj.attachmentPdfName = pdfInfo.name;
-        updatedStore = true;
-      }
       for (const t of memoryStore.tests) {
         if (String(t.folderId || '') === fId && !t.attachmentPdfId) {
           t.attachmentPdfId = pdfInfo.id;
@@ -699,19 +648,23 @@ function getBootstrapBuffer(): Buffer {
   if (cachedBootstrapBuffer && cachedBootstrapVersion === memoryStore.version) {
     return cachedBootstrapBuffer;
   }
+  const enrichedTests = memoryStore.tests.map((t) => ({
+    ...t,
+    hasPlayablePaper: hasPlayableLocalPaper(t),
+  }));
   const payload = {
     version: memoryStore.version,
     portalLogoUrl: memoryStore.portalLogoUrl || DEFAULT_VS_LOGO_URL,
     globalAttachmentPdf: memoryStore.globalAttachmentPdf || null,
-    tests: memoryStore.tests,
+    tests: enrichedTests,
     deletedTestIds: memoryStore.deletedTestIds,
     deletedFolderIds: memoryStore.deletedFolderIds,
     deletedStudentIds: memoryStore.deletedStudentIds || [],
     deletedAttemptIds: memoryStore.deletedAttemptIds || [],
     tickedStudentMap: memoryStore.tickedStudentMap || {},
     folders: memoryStore.folders,
-    students: memoryStore.students.slice(0, 500),
-    attempts: memoryStore.attempts.slice(0, 300),
+    students: memoryStore.students.slice(0, 10000),
+    attempts: memoryStore.attempts.slice(0, 5000),
     notifications: memoryStore.notifications.slice(0, 50),
   };
   cachedBootstrapBuffer = Buffer.from(JSON.stringify(payload), 'utf-8');
@@ -888,6 +841,7 @@ async function startServer() {
   function isPlaceholderQuestionText(str: unknown): boolean {
     const s = String(str || '').trim();
     if (!s) return true;
+    if (/^(?:en|hi|so|sh|sol|q):\d+$/i.test(s)) return true;
     if (/^(physics|chemistry|biology|botany|zoology|mathematics|science|neet(\s+syllabus)?|question\s*\d*)$/i.test(s)) {
       return true;
     }
@@ -1145,8 +1099,10 @@ async function startServer() {
 
   function buildServerStandaloneCbtHtml(
     meta: Record<string, unknown>,
-    questions: Record<string, unknown>[]
+    questions: Record<string, unknown>[],
+    opts?: { inlineAllImages?: boolean }
   ): string {
+    const inlineAll = Boolean(opts?.inlineAllImages);
     const rawTestId = String(meta?.id || '').replace(/[^a-zA-Z0-9_-]/g, '_');
     const N = questions.length || Number(meta?.totalQuestions) || 90;
     const rawDur = Number(meta?.durationMinutes) || 90;
@@ -1164,13 +1120,22 @@ async function startServer() {
         ensureImageDataUrlServer(imgs[1]) ||
         ensureImageDataUrlServer(q.questionEn);
 
-      // Keep Question 1 inline (<120KB) for 0-RTT first paint; stream Q2..QN via binary /qimg endpoint so paper.html is ~50KB instead of 9MB!
+      // Keep Question 1 inline (<120KB) for 0-RTT first paint; stream Q2..QN via binary /qimg endpoint
+      // UNLESS ?offline=1 is requested, in which case embed all question images inline for 100% offline playback!
       const hiImg =
-        rawHiImg && rawHiImg.startsWith('data:image/') && rawTestId && (idx > 0 || rawHiImg.length > 120000)
+        !inlineAll &&
+        rawHiImg &&
+        rawHiImg.startsWith('data:image/') &&
+        rawTestId &&
+        (idx > 0 || rawHiImg.length > 120000)
           ? `/api/store/test/${encodeURIComponent(rawTestId)}/qimg/${idx}/hi`
           : rawHiImg;
       const enImg =
-        rawEnImg && rawEnImg.startsWith('data:image/') && rawTestId && (idx > 0 || rawEnImg.length > 120000)
+        !inlineAll &&
+        rawEnImg &&
+        rawEnImg.startsWith('data:image/') &&
+        rawTestId &&
+        (idx > 0 || rawEnImg.length > 120000)
           ? rawEnImg === rawHiImg && hiImg
             ? hiImg
             : `/api/store/test/${encodeURIComponent(rawTestId)}/qimg/${idx}/en`
@@ -1207,7 +1172,7 @@ async function startServer() {
     const safeSubTitle = String(meta?.subTitle || 'Bilingual CBT Paper').replace(/</g, '&lt;');
     const safeSubject = String(meta?.subject || 'NEET').replace(/</g, '&lt;');
 
-    return `<!doctype html><html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>${safeTitle}</title><style>:root{--blue:#168acb;--ink:#183449;--line:#c9e5f4}*{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#effaff,#dff3ff 48%,#f8fcff);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}button{font:inherit;cursor:pointer}.top{position:sticky;top:0;z-index:5;background:#f7fcffed;backdrop-filter:blur(14px);border-bottom:1px solid var(--line);padding:10px}.brand{max-width:1100px;margin:auto;display:flex;justify-content:space-between;align-items:center;gap:8px}.logo{font-weight:900;color:#145d88}.logo small{display:block;font-size:10px;letter-spacing:2px;color:#6a93aa}.pill{border:1px solid #b9dced;border-radius:999px;padding:8px 11px;background:white;font-weight:800;color:#175b82;font-variant-numeric:tabular-nums}.wrap{max-width:1100px;margin:16px auto;padding:0 12px 30px;display:grid;grid-template-columns:minmax(0,1fr);gap:13px}.panel{background:#ffffffed;border:1px solid var(--line);border-radius:17px;box-shadow:0 10px 28px #3a8db515}.info{padding:14px 16px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}.sub{font-size:12px;color:#658196;font-weight:650}.tag{font-size:11px;background:#e4f5ff;color:#1c6f9f;padding:5px 9px;border-radius:99px;font-weight:800}.progress{height:6px;background:#e4f1f8;border-radius:9px;overflow:hidden;margin-top:7px}.progress span{display:block;height:100%;background:var(--blue);width:0}.qhead{display:flex;justify-content:space-between;align-items:center;padding:13px 15px;border-bottom:1px solid var(--line)}.qnum{font-weight:900;color:#145d88}.question{padding:12px}.langlabel{font-size:11px;font-weight:900;color:#1b6d99;margin:3px 0 5px}.qimage{display:block;width:100%;height:auto;border:1px solid #d7eaf5;border-radius:9px;background:white}.qtext{font-size:18px;font-weight:750;line-height:1.55;padding:10px 12px;background:#fff;border:1px solid #d7eaf5;border-radius:9px;white-space:pre-line}.lang-switch{background:#eaf7ff;border-color:#9bd5f3;color:#145d88;font-weight:800}.options{display:grid;gap:8px;margin-top:13px}.opt{width:100%;text-align:left;background:#f8fcff;border:1.5px solid #d4e8f4;border-radius:11px;padding:10px 12px;color:var(--ink);display:flex;align-items:center;gap:10px;min-height:46px;font-weight:700}.letter{width:27px;height:27px;border-radius:50%;display:grid;place-items:center;background:#e5f4fc;color:#216b93;font-weight:900;flex:none}.opt.selected{border-color:var(--blue);background:#e9f7ff}.opt.selected .letter{background:var(--blue);color:white}.controls{padding:12px 13px;border-top:1px solid var(--line);display:flex;gap:7px;flex-wrap:wrap}.btn{border:1px solid #b9dced;background:white;color:#1a628b;border-radius:10px;padding:10px 12px;font-weight:800}.primary{background:var(--blue);border-color:var(--blue);color:white}.green{background:#159b69;border-color:#159b69;color:white}.warn{color:#a46a10}.btn:disabled{opacity:.4}.palette-toggle{border:1px solid #a6d6ed;border-radius:11px;padding:8px 10px;color:#17658f;font-weight:800;background:#e8f7ff;white-space:nowrap;min-height:39px}.side{padding:14px;position:fixed;z-index:9;top:65px;right:12px;width:min(340px,calc(100vw - 24px));max-height:calc(100dvh - 80px);overflow:auto;box-shadow:0 16px 50px #20597b36;background:#fff}.side[hidden]{display:none}.drawer-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.drawer-head h3{margin:0;font-size:15px}.palette-close{border:1px solid #cce7f3;background:#f2faff;color:#1a628b;border-radius:9px;width:34px;height:34px;font-size:16px}.legend{font-size:11px;color:#658196;margin:10px 0;display:flex;gap:10px;flex-wrap:wrap}.dot{display:inline-block;width:9px;height:9px;border-radius:3px;background:#e5f1f7;margin-right:4px}.dot.done{background:#168acb}.dot.review{background:#e7a72c}.palette{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:10px}.pal{border:1px solid #cfe4ef;border-radius:7px;background:#f8fcff;color:#315b73;padding:7px 0;font-weight:800;font-size:12px}.pal.current{outline:2px solid #145d88}.pal.done{background:var(--blue);border-color:var(--blue);color:white}.pal.review{background:#e7a72c;border-color:#e7a72c;color:white}.question-image-frame{position:relative;isolation:isolate;background:#fff;border-radius:9px;overflow:hidden}.question-image-frame::before{content:"VS";position:absolute;left:50%;top:50%;transform:translate(-50%,-50%) rotate(-23deg);font-weight:900;letter-spacing:.04em;font-size:clamp(70px,17vw,180px);color:rgba(36,145,198,.085);z-index:0;pointer-events:none;white-space:nowrap}.question-image-frame .qimage{position:relative;z-index:1;mix-blend-mode:multiply}.overlay{position:fixed;inset:0;background:#10293acc;display:none;place-items:center;padding:16px;z-index:20;overflow:auto}.modal{background:white;border-radius:18px;max-width:760px;width:min(760px,100%);max-height:calc(100vh - 32px);overflow:auto;padding:22px;border:1px solid var(--line);box-shadow:0 20px 60px #0c263638;text-align:left}.heart-stage{position:relative;min-height:300px;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden;text-align:center;background:linear-gradient(145deg,#effaff,#fff)}.big-heart{font-size:76px;animation:heartBeat .85s ease-in-out infinite}.float-heart{position:absolute;bottom:-45px;font-size:24px;animation:floatHeart 2.5s ease-out forwards;opacity:0;pointer-events:none}@keyframes heartBeat{0%,100%{transform:scale(1)}50%{transform:scale(1.18)}}@keyframes floatHeart{0%{transform:translateY(0) scale(.7) rotate(-10deg);opacity:0}15%{opacity:1}100%{transform:translateY(-340px) scale(1.25) rotate(18deg);opacity:0}}.analysis-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}.analysis-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin:14px 0}.analysis-card{background:#f2faff;border:1px solid #d8edf8;border-radius:12px;padding:12px}.analysis-card b{display:block;font-size:22px;color:#145d88}.analysis-section{margin-top:18px}.review-row{border:1px solid #d9eaf4;border-radius:11px;margin:8px 0;overflow:hidden}.review-row summary{padding:11px;background:#f7fcff;cursor:pointer;font-weight:800}.review-body{padding:12px;font-size:14px;line-height:1.5}.review-body img{width:100%;height:auto;border:1px solid #d7eaf5;border-radius:8px;margin:6px 0}.status-good{color:#13804a}.status-bad{color:#bd3b3b}.status-skip{color:#667788}footer{text-align:center;color:#7894a6;font-size:11px;padding:12px}@media(max-width:760px){.controls .btn{flex:1}.question{padding:8px}.qimage{border-radius:7px}}@media(max-width:480px){.brand{gap:4px}.brand>div:last-child{gap:3px!important}.brand .logo{font-size:12px}.brand .logo small{font-size:8px;letter-spacing:1px}.brand .pill{font-size:11px;padding:8px 6px}.palette-toggle{font-size:11px;padding:8px 7px}.side{top:61px}}</style></head><body><header class="top"><div class="brand"><div class="logo">VS TEST NEET<small>ICE BLUE · BILINGUAL CBT</small></div><div style="display:flex;gap:6px;align-items:center"><button type="button" class="pill lang-switch" id="langBtn">HI + EN</button><span class="pill" id="timer">00:00:00</span><span class="pill" id="count">0 / ${N}</span><button type="button" class="pill" id="topSubmit" style="background:#159b69;color:#fff;border-color:#159b69">Submit ✓</button><button type="button" class="palette-toggle" id="paletteToggle" aria-expanded="false" aria-controls="paletteDrawer">☷ <span>Palette</span></button></div></div></header><div class="wrap"><main class="main"><section class="panel info"><div><b>${safeTitle}</b><div class="sub">${safeSubTitle} · ${safeSubject}</div></div><div><span class="tag">${N} Questions · ${Math.round(DURATION / 60)} Minutes</span><div class="progress"><span id="progress"></span></div></div></section><section class="panel" style="margin-top:12px"><div class="qhead"><div><span class="qnum" id="qtitle">Question 1 of ${N}</span><div class="sub" id="qsub">एक सही विकल्प चुनें / Choose one option</div></div><span class="tag" id="status">Not Answered</span></div><div class="question"><div id="hiBlock"><div class="langlabel">हिन्दी (HINDI)</div><div class="question-image-frame" id="hiImgWrap" style="display:none"><img id="hi" class="qimage" alt="Hindi question"></div><div id="hiText" class="qtext" style="display:none"></div></div><div id="enBlock" style="margin-top:10px"><div class="langlabel">ENGLISH</div><div class="question-image-frame" id="enImgWrap" style="display:none"><img id="en" class="qimage" alt="English question"></div><div id="enText" class="qtext" style="display:none"></div></div><div class="options" id="options"></div></div><div class="controls"><button class="btn" id="prev">← Previous</button><button class="btn warn" id="clear">Clear Response</button><button class="btn" id="mark">☆ Mark Review</button><button class="btn primary" id="next">Save & Next →</button><button class="btn green" id="submitMain">Submit Test ✓</button></div></section></main><aside class="panel side" id="paletteDrawer" aria-label="Question palette" hidden><div class="drawer-head"><h3>Question Palette</h3><button class="palette-close" id="paletteClose" type="button">✕</button></div><div class="sub">किसी भी प्रश्न पर जाने के लिए नंबर दबाएँ।</div><div class="legend"><span><i class="dot done"></i>Answered</span><span><i class="dot review"></i>Review</span><span><i class="dot"></i>Not answered</span></div><div class="palette" id="palette"></div><div class="controls" style="padding:13px 0 0"><button class="btn green" id="submit" style="width:100%">Submit Test</button></div></aside></div><footer>VS TEST NEET · ${safeTitle}</footer><div class="overlay" id="overlay"><div class="modal" id="modal"></div></div><script>const DATA=${JSON.stringify(compactQs)};const N=DATA.length,DURATION=${DURATION},MAX=${MAX},L=['1','2','3','4'],A={},M=new Set(),T={};let cur=0,sec=DURATION,done=false,lang='BOTH',timer;const started=Date.now(),$=x=>document.getElementById(x);function applyLanguage(){const item=DATA[cur]||{};const hasHi=Boolean(item.hiImg||item.qHi);const hasEn=Boolean(item.enImg||item.qEn);const showHi=(lang==='BOTH'||lang==='HI')&&hasHi||(lang==='EN'&&!hasEn&&hasHi);const showEn=(lang==='BOTH'||lang==='EN')&&hasEn||(lang==='HI'&&!hasHi&&hasEn);$('hiBlock').style.display=showHi?'block':'none';$('enBlock').style.display=showEn?'block':'none';$('langBtn').textContent=lang==='BOTH'?'HI + EN':lang==='HI'?'हिन्दी':'ENGLISH'}$('langBtn').onclick=()=>{lang=lang==='BOTH'?'HI':lang==='HI'?'EN':'BOTH';render()};function render(){const item=DATA[cur]||{},q=cur+1;$('qtitle').textContent='Question '+q+' of '+N;$('qsub').textContent=item.chapter||'एक सही विकल्प चुनें / Choose one option';if(item.hiImg){$('hiImgWrap').style.display='block';$('hi').src=item.hiImg;$('hiText').style.display='none'}else if(item.qHi){$('hiImgWrap').style.display='none';$('hiText').style.display='block';$('hiText').innerHTML=item.qHi}else{$('hiImgWrap').style.display='none';$('hiText').style.display='none'}if(item.enImg){$('enImgWrap').style.display='block';$('en').src=item.enImg;$('enText').style.display='none'}else if(item.qEn){$('enImgWrap').style.display='none';$('enText').style.display='block';$('enText').innerHTML=item.qEn}else{$('enImgWrap').style.display='none';$('enText').style.display='none'}applyLanguage();[cur+1,cur+2].forEach(nxIdx=>{const nx=DATA[nxIdx];if(nx){if(nx.hiImg&&nx.hiImg.charAt(0)==='/'){const im=new Image();im.src=nx.hiImg}if(nx.enImg&&nx.enImg.charAt(0)==='/'&&nx.enImg!==nx.hiImg){const im2=new Image();im2.src=nx.enImg}}});$('status').textContent=A[q]?'Answered':M.has(q)?'Review':'Not Answered';$('options').innerHTML=L.map((l,i)=>{const hiO=(item.optsHi&&item.optsHi[i])||'';const enO=(item.optsEn&&item.optsEn[i])||'';const isGeneric=(!hiO&&!enO)||(/^Option\\s*\\(?\\d/i.test(enO)&&(!hiO||/^विकल्प/i.test(hiO)));const labelText=isGeneric?'Option '+l:(lang==='HI'?(hiO||enO):lang==='EN'?(enO||hiO):(hiO&&enO&&hiO!==enO?hiO+' / '+enO:(hiO||enO)));return '<button class="opt '+(A[q]===i+1?'selected':'')+'" data-v="'+(i+1)+'"><span class="letter">'+l+'</span><span>'+labelText+'</span></button>'}).join('');document.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>{if(done)return;A[q]=+b.dataset.v;render()});$('prev').disabled=cur===0;$('next').textContent=cur===N-1?'Finish & Submit →':'Save & Next →';$('mark').textContent=M.has(q)?'★ Remove Review':'☆ Mark Review';let count=Object.keys(A).length;$('count').textContent=count+' / '+N;$('progress').style.width=(count/N*100)+'%';palette()}function palette(){$('palette').innerHTML=Array.from({length:N},(_,i)=>'<button class="pal '+(A[i+1]?'done':'')+' '+(M.has(i+1)?'review':'')+' '+(i===cur?'current':'')+'" data-i="'+i+'">'+(i+1)+'</button>').join('');document.querySelectorAll('[data-i]').forEach(b=>b.onclick=()=>{if(done)return;cur=+b.dataset.i;render();closePalette()})}function closePalette(){$('paletteDrawer').hidden=true;$('paletteToggle').setAttribute('aria-expanded','false')}$('paletteToggle').onclick=()=>{let d=$('paletteDrawer');d.hidden=!d.hidden;$('paletteToggle').setAttribute('aria-expanded',String(!d.hidden))};$('paletteClose').onclick=closePalette;document.addEventListener('click',e=>{if(!$('paletteDrawer').hidden&&!$('paletteDrawer').contains(e.target)&&!$('paletteToggle').contains(e.target))closePalette()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closePalette()});function show(s){$('timer').textContent=[Math.floor(s/3600),Math.floor(s%3600/60),s%60].map(n=>String(n).padStart(2,'0')).join(':')};function modal(s){closePalette();$('modal').innerHTML=s;$('overlay').style.display='grid'}function hide(){$('overlay').style.display='none'}function submit(){if(done){result();return}modal('<h2>Submit Test?</h2><p>Attempted: <b>'+Object.keys(A).length+'</b> · Unanswered: <b>'+(N-Object.keys(A).length)+'</b></p><p>Marking Scheme: +4 correct, −1 incorrect, 0 unattempted.</p><div class="controls"><button class="btn" id="back">Go Back</button><button class="btn green" id="yes">Confirm Submit</button></div>');$('back').onclick=hide;$('yes').onclick=()=>{if(done)return;done=true;sec=Math.max(0,DURATION-Math.floor((Date.now()-started)/1000));show(sec);clearInterval(timer);heartCelebration()}}function heartCelebration(){modal('<div class="heart-stage" role="status"><div class="big-heart" aria-hidden="true">❤️</div><h2>Thank You for Completing Your Test ❤️</h2><p class="sub">Your scorecard & solutions are ready</p><button class="btn primary" id="skipHeart">Skip Animation · View Result</button></div>');const stage=document.querySelector('.heart-stage');['❤️','💗','💙','✨','💕','💙','✨','❤️'].forEach((h,i)=>{let e=document.createElement('span');e.className='float-heart';e.textContent=h;styleLeft=(7+i*12)+'%';e.style.left=styleLeft;e.style.animationDelay=(i*.1)+'s';stage.appendChild(e)});let finished=false;const finish=()=>{if(finished)return;finished=true;result()};$('skipHeart').onclick=finish;setTimeout(finish,1800)}function result(){let correct=0,wrong=0,blank=0;DATA.forEach((item,i)=>{const picked=A[i+1];if(!picked)blank++;else if(picked===item.ans)correct++;else wrong++});const score=correct*4-wrong;const attempted=correct+wrong;const acc=attempted?Math.round(correct/attempted*100):0;const spent=DURATION-sec;const fmt=t=>[Math.floor(t/3600),Math.floor(t%3600/60),t%60].map(n=>String(n).padStart(2,'0')).join(':');try{window.parent.postMessage({type:'VS_CBT_HTML_SUBMIT',score,maxMarks:MAX,correctCount:correct,wrongCount:wrong,unattemptedCount:blank,accuracy:acc,timeTakenSeconds:Math.max(1,spent),answers:A,questionTimes:T},'*')}catch(e){}let rows=DATA.map((item,i)=>{const picked=A[i+1];const cls=!picked?'status-skip':picked===item.ans?'status-good':'status-bad';const st=!picked?'Unattempted':picked===item.ans?'Correct (+4)':'Wrong (-1)';return '<details class="review-row" data-question="'+(i+1)+'"><summary class="'+cls+'">Q'+(i+1)+' · '+(picked?'Selected: ('+picked+')':'Unattempted')+' · Correct: ('+item.ans+') · '+st+'</summary><div class="review-body"><div class="lazy-question"></div>'+(item.expHi||item.expEn?'<p><b>Explanation:</b> '+(item.expHi||'')+' '+(item.expEn||'')+'</p>':'')+'</div></details>'}).join('');modal('<div class="analysis-head"><div><h2>'+${JSON.stringify(String(meta?.title || 'Test'))}+' · Result & Analysis</h2><div class="sub">Scorecard & Question-wise Review (+4 / −1)</div></div><div class="analysis-top-btns" style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="close">Close Review</button></div></div><div class="analysis-grid"><div class="analysis-card"><b>'+score+' / '+MAX+'</b><span>Total Score</span></div><div class="analysis-card"><b>'+acc+'%</b><span>Accuracy</span></div><div class="analysis-card"><b class="status-good">'+correct+' (+'+(correct*4)+')</b><span>Correct Answers</span></div><div class="analysis-card"><b class="status-bad">'+wrong+' (-'+wrong+')</b><span>Wrong Answers</span></div><div class="analysis-card"><b>'+blank+'</b><span>Unattempted</span></div><div class="analysis-card"><b>'+fmt(spent)+'</b><span>Time Taken</span></div></div><section class="analysis-section"><h3>Question-wise Solutions & Answer Key</h3>'+rows+'</section>');document.querySelectorAll('details[data-question]').forEach(d=>d.addEventListener('toggle',()=>{let box=d.querySelector('.lazy-question');if(d.open){const it=DATA[+d.dataset.question-1]||{};box.innerHTML=(it.hiImg?'<img src="'+it.hiImg+'" alt="Hindi question">':it.qHi?'<div>'+it.qHi+'</div>':'')+(it.enImg?'<img src="'+it.enImg+'" alt="English question">':it.qEn?'<div style="margin-top:6px">'+it.qEn+'</div>':'')}else box.innerHTML=''}));$('close').onclick=()=>{hide();$('submit').textContent='Open Result & Analysis'}}$('prev').onclick=()=>{if(cur>0){cur--;render()}};$('next').onclick=()=>{if(cur<N-1){cur++;render()}else submit()};$('clear').onclick=()=>{delete A[cur+1];render()};$('mark').onclick=()=>{let n=cur+1;M.has(n)?M.delete(n):M.add(n);render()};$('submit').onclick=submit;if($('submitMain'))$('submitMain').onclick=submit;if($('topSubmit'))$('topSubmit').onclick=submit;show(sec);render();timer=setInterval(()=>{if(done)return;T[cur]=(T[cur]||0)+1;sec=Math.max(0,DURATION-Math.floor((Date.now()-started)/1000));show(sec);if(sec<=0){done=true;clearInterval(timer);heartCelebration()}},1000);</script></body></html>`;
+    return `<!doctype html><html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>${safeTitle}</title><style>:root{--blue:#168acb;--ink:#183449;--line:#c9e5f4}*{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#effaff,#dff3ff 48%,#f8fcff);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}button{font:inherit;cursor:pointer}.top{position:sticky;top:0;z-index:5;background:#f7fcffed;backdrop-filter:blur(14px);border-bottom:1px solid var(--line);padding:10px}.brand{max-width:1100px;margin:auto;display:flex;justify-content:space-between;align-items:center;gap:8px}.logo{font-weight:900;color:#145d88}.logo small{display:block;font-size:10px;letter-spacing:2px;color:#6a93aa}.pill{border:1px solid #b9dced;border-radius:999px;padding:8px 11px;background:white;font-weight:800;color:#175b82;font-variant-numeric:tabular-nums}.wrap{max-width:1100px;margin:16px auto;padding:0 12px 30px;display:grid;grid-template-columns:minmax(0,1fr);gap:13px}.panel{background:#ffffffed;border:1px solid var(--line);border-radius:17px;box-shadow:0 10px 28px #3a8db515}.info{padding:14px 16px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}.sub{font-size:12px;color:#658196;font-weight:650}.tag{font-size:11px;background:#e4f5ff;color:#1c6f9f;padding:5px 9px;border-radius:99px;font-weight:800}.progress{height:6px;background:#e4f1f8;border-radius:9px;overflow:hidden;margin-top:7px}.progress span{display:block;height:100%;background:var(--blue);width:0}.qhead{display:flex;justify-content:space-between;align-items:center;padding:13px 15px;border-bottom:1px solid var(--line)}.qnum{font-weight:900;color:#145d88}.question{padding:12px}.langlabel{font-size:11px;font-weight:900;color:#1b6d99;margin:3px 0 5px}.qimage{display:block;width:100%;height:auto;border:1px solid #d7eaf5;border-radius:9px;background:white}.qtext{font-size:18px;font-weight:750;line-height:1.55;padding:10px 12px;background:#fff;border:1px solid #d7eaf5;border-radius:9px;white-space:pre-line}.lang-switch{background:#eaf7ff;border-color:#9bd5f3;color:#145d88;font-weight:800}.options{display:grid;gap:8px;margin-top:13px}.opt{width:100%;text-align:left;background:#f8fcff;border:1.5px solid #d4e8f4;border-radius:11px;padding:10px 12px;color:var(--ink);display:flex;align-items:center;gap:10px;min-height:46px;font-weight:700}.letter{width:27px;height:27px;border-radius:50%;display:grid;place-items:center;background:#e5f4fc;color:#216b93;font-weight:900;flex:none}.opt.selected{border-color:var(--blue);background:#e9f7ff}.opt.selected .letter{background:var(--blue);color:white}.controls{padding:12px 13px;border-top:1px solid var(--line);display:flex;gap:7px;flex-wrap:wrap}.btn{border:1px solid #b9dced;background:white;color:#1a628b;border-radius:10px;padding:10px 12px;font-weight:800}.primary{background:var(--blue);border-color:var(--blue);color:white}.green{background:#159b69;border-color:#159b69;color:white}.warn{color:#a46a10}.btn:disabled{opacity:.4}.palette-toggle{border:1px solid #a6d6ed;border-radius:11px;padding:8px 10px;color:#17658f;font-weight:800;background:#e8f7ff;white-space:nowrap;min-height:39px}.side{padding:14px;position:fixed;z-index:9;top:65px;right:12px;width:min(340px,calc(100vw - 24px));max-height:calc(100dvh - 80px);overflow:auto;box-shadow:0 16px 50px #20597b36;background:#fff}.side[hidden]{display:none}.drawer-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.drawer-head h3{margin:0;font-size:15px}.palette-close{border:1px solid #cce7f3;background:#f2faff;color:#1a628b;border-radius:9px;width:34px;height:34px;font-size:16px}.legend{font-size:11px;color:#658196;margin:10px 0;display:flex;gap:10px;flex-wrap:wrap}.dot{display:inline-block;width:9px;height:9px;border-radius:3px;background:#e5f1f7;margin-right:4px}.dot.done{background:#168acb}.dot.review{background:#e7a72c}.palette{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:10px}.pal{border:1px solid #cfe4ef;border-radius:7px;background:#f8fcff;color:#315b73;padding:7px 0;font-weight:800;font-size:12px}.pal.current{outline:2px solid #145d88}.pal.done{background:var(--blue);border-color:var(--blue);color:white}.pal.review{background:#e7a72c;border-color:#e7a72c;color:white}.question-image-frame{position:relative;isolation:isolate;background:#fff;border-radius:9px;overflow:hidden}.question-image-frame::before{content:"VS";position:absolute;left:50%;top:50%;transform:translate(-50%,-50%) rotate(-23deg);font-weight:900;letter-spacing:.04em;font-size:clamp(70px,17vw,180px);color:rgba(36,145,198,.085);z-index:0;pointer-events:none;white-space:nowrap}.question-image-frame .qimage{position:relative;z-index:1;mix-blend-mode:multiply}.overlay{position:fixed;inset:0;background:#10293acc;display:none;place-items:center;padding:16px;z-index:20;overflow:auto}.modal{background:white;border-radius:18px;max-width:760px;width:min(760px,100%);max-height:calc(100vh - 32px);overflow:auto;padding:22px;border:1px solid var(--line);box-shadow:0 20px 60px #0c263638;text-align:left}.heart-stage{position:relative;min-height:300px;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden;text-align:center;background:linear-gradient(145deg,#effaff,#fff)}.big-heart{font-size:76px;animation:heartBeat .85s ease-in-out infinite}.float-heart{position:absolute;bottom:-45px;font-size:24px;animation:floatHeart 2.5s ease-out forwards;opacity:0;pointer-events:none}@keyframes heartBeat{0%,100%{transform:scale(1)}50%{transform:scale(1.18)}}@keyframes floatHeart{0%{transform:translateY(0) scale(.7) rotate(-10deg);opacity:0}15%{opacity:1}100%{transform:translateY(-340px) scale(1.25) rotate(18deg);opacity:0}}.analysis-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}.analysis-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin:14px 0}.analysis-card{background:#f2faff;border:1px solid #d8edf8;border-radius:12px;padding:12px}.analysis-card b{display:block;font-size:22px;color:#145d88}.analysis-section{margin-top:18px}.review-row{border:1px solid #d9eaf4;border-radius:11px;margin:8px 0;overflow:hidden}.review-row summary{padding:11px;background:#f7fcff;cursor:pointer;font-weight:800}.review-body{padding:12px;font-size:14px;line-height:1.5}.review-body img{width:100%;height:auto;border:1px solid #d7eaf5;border-radius:8px;margin:6px 0}.status-good{color:#13804a}.status-bad{color:#bd3b3b}.status-skip{color:#667788}footer{text-align:center;color:#7894a6;font-size:11px;padding:12px}@media(max-width:760px){.controls .btn{flex:1}.question{padding:8px}.qimage{border-radius:7px}}@media(max-width:480px){.brand{gap:4px}.brand>div:last-child{gap:3px!important}.brand .logo{font-size:12px}.brand .logo small{font-size:8px;letter-spacing:1px}.brand .pill{font-size:11px;padding:8px 6px}.palette-toggle{font-size:11px;padding:8px 7px}.side{top:61px}}</style></head><body><header class="top"><div class="brand"><div class="logo">VS TEST NEET<small>ICE BLUE · BILINGUAL CBT</small></div><div style="display:flex;gap:6px;align-items:center"><button type="button" class="pill lang-switch" id="langBtn">HI + EN</button><span class="pill" id="timer">00:00:00</span><span class="pill" id="count">0 / ${N}</span><button type="button" class="pill" id="topSubmit" style="background:#159b69;color:#fff;border-color:#159b69">Submit ✓</button><button type="button" class="palette-toggle" id="paletteToggle" aria-expanded="false" aria-controls="paletteDrawer">☷ <span>Palette</span></button></div></div></header><div class="wrap"><main class="main"><section class="panel info"><div><b>${safeTitle}</b><div class="sub">${safeSubTitle} · ${safeSubject}</div></div><div><span class="tag">${N} Questions · ${Math.round(DURATION / 60)} Minutes</span><div class="progress"><span id="progress"></span></div></div></section><section class="panel" style="margin-top:12px"><div class="qhead"><div><span class="qnum" id="qtitle">Question 1 of ${N}</span><div class="sub" id="qsub">एक सही विकल्प चुनें / Choose one option</div></div><span class="tag" id="status">Not Answered</span></div><div class="question"><div id="hiBlock"><div class="langlabel">हिन्दी (HINDI)</div><div class="question-image-frame" id="hiImgWrap" style="display:none"><img id="hi" class="qimage" alt="Hindi question"></div><div id="hiText" class="qtext" style="display:none"></div></div><div id="enBlock" style="margin-top:10px"><div class="langlabel">ENGLISH</div><div class="question-image-frame" id="enImgWrap" style="display:none"><img id="en" class="qimage" alt="English question"></div><div id="enText" class="qtext" style="display:none"></div></div><div class="options" id="options"></div></div><div class="controls"><button class="btn" id="prev">← Previous</button><button class="btn warn" id="clear">Clear Response</button><button class="btn" id="mark">☆ Mark Review</button><button class="btn primary" id="next">Save & Next →</button><button class="btn green" id="submitMain">Submit Test ✓</button></div></section></main><aside class="panel side" id="paletteDrawer" aria-label="Question palette" hidden><div class="drawer-head"><h3>Question Palette</h3><button class="palette-close" id="paletteClose" type="button">✕</button></div><div class="sub">किसी भी प्रश्न पर जाने के लिए नंबर दबाएँ।</div><div class="legend"><span><i class="dot done"></i>Answered</span><span><i class="dot review"></i>Review</span><span><i class="dot"></i>Not answered</span></div><div class="palette" id="palette"></div><div class="controls" style="padding:13px 0 0"><button class="btn green" id="submit" style="width:100%">Submit Test</button></div></aside></div><footer>VS TEST NEET · ${safeTitle}</footer><div class="overlay" id="overlay"><div class="modal" id="modal"></div></div><script>const DATA=${JSON.stringify(compactQs)};const N=DATA.length,DURATION=${DURATION},MAX=${MAX},L=['1','2','3','4'],A={},M=new Set(),T={};let cur=0,sec=DURATION,done=false,lang='BOTH',timer;const started=Date.now(),$=x=>document.getElementById(x);function applyLanguage(){const item=DATA[cur]||{};const hasHi=Boolean(item.hiImg||item.qHi);const hasEn=Boolean(item.enImg||item.qEn);const showHi=(lang==='BOTH'||lang==='HI')&&hasHi||(lang==='EN'&&!hasEn&&hasHi);const showEn=(lang==='BOTH'||lang==='EN')&&hasEn||(lang==='HI'&&!hasHi&&hasEn);$('hiBlock').style.display=showHi?'block':'none';$('enBlock').style.display=showEn?'block':'none';$('langBtn').textContent=lang==='BOTH'?'HI + EN':lang==='HI'?'हिन्दी':'ENGLISH'}$('langBtn').onclick=()=>{lang=lang==='BOTH'?'HI':lang==='HI'?'EN':'BOTH';render()};function render(){const item=DATA[cur]||{},q=cur+1;$('qtitle').textContent='Question '+q+' of '+N;$('qsub').textContent=item.chapter||'एक सही विकल्प चुनें / Choose one option';if(item.hiImg){$('hiImgWrap').style.display='block';$('hi').src=item.hiImg;$('hiText').style.display='none'}else if(item.qHi){$('hiImgWrap').style.display='none';$('hiText').style.display='block';$('hiText').innerHTML=item.qHi}else{$('hiImgWrap').style.display='none';$('hiText').style.display='none'}if(item.enImg){$('enImgWrap').style.display='block';$('en').src=item.enImg;$('enText').style.display='none'}else if(item.qEn){$('enImgWrap').style.display='none';$('enText').style.display='block';$('enText').innerHTML=item.qEn}else{$('enImgWrap').style.display='none';$('enText').style.display='none'}applyLanguage();[cur+1,cur+2].forEach(nxIdx=>{const nx=DATA[nxIdx];if(nx){if(nx.hiImg&&nx.hiImg.charAt(0)==='/'){const im=new Image();im.src=nx.hiImg}if(nx.enImg&&nx.enImg.charAt(0)==='/'&&nx.enImg!==nx.hiImg){const im2=new Image();im2.src=nx.enImg}}});$('status').textContent=A[q]?'Answered':M.has(q)?'Review':'Not Answered';$('options').innerHTML=L.map((l,i)=>{const hiO=(item.optsHi&&item.optsHi[i])||'';const enO=(item.optsEn&&item.optsEn[i])||'';const isGeneric=(!hiO&&!enO)||(/^Option\\s*\\(?\\d/i.test(enO)&&(!hiO||/^विकल्प/i.test(hiO)));const labelText=isGeneric?'Option '+l:(lang==='HI'?(hiO||enO):lang==='EN'?(enO||hiO):(hiO&&enO&&hiO!==enO?hiO+' / '+enO:(hiO||enO)));return '<button class="opt '+(A[q]===i+1?'selected':'')+'" data-v="'+(i+1)+'"><span class="letter">'+l+'</span><span>'+labelText+'</span></button>'}).join('');document.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>{if(done)return;A[q]=+b.dataset.v;render()});$('prev').disabled=cur===0;$('next').textContent=cur===N-1?'Finish & Submit →':'Save & Next →';$('mark').textContent=M.has(q)?'★ Remove Review':'☆ Mark Review';let count=Object.keys(A).length;$('count').textContent=count+' / '+N;$('progress').style.width=(count/N*100)+'%';palette()}function palette(){$('palette').innerHTML=Array.from({length:N},(_,i)=>'<button class="pal '+(A[i+1]?'done':'')+' '+(M.has(i+1)?'review':'')+' '+(i===cur?'current':'')+'" data-i="'+i+'">'+(i+1)+'</button>').join('');document.querySelectorAll('[data-i]').forEach(b=>b.onclick=()=>{if(done)return;cur=+b.dataset.i;render();closePalette()})}function closePalette(){$('paletteDrawer').hidden=true;$('paletteToggle').setAttribute('aria-expanded','false')}$('paletteToggle').onclick=()=>{let d=$('paletteDrawer');d.hidden=!d.hidden;$('paletteToggle').setAttribute('aria-expanded',String(!d.hidden))};$('paletteClose').onclick=closePalette;document.addEventListener('click',e=>{if(!$('paletteDrawer').hidden&&!$('paletteDrawer').contains(e.target)&&!$('paletteToggle').contains(e.target))closePalette()});document.addEventListener('keydown',e=>{if(e.key==='Escape')closePalette()});function show(s){$('timer').textContent=[Math.floor(s/3600),Math.floor(s%3600/60),s%60].map(n=>String(n).padStart(2,'0')).join(':')};function modal(s){closePalette();$('modal').innerHTML=s;$('overlay').style.display='grid'}function hide(){$('overlay').style.display='none'}function submit(){if(done){result();return}modal('<h2>Submit Test?</h2><p>Attempted: <b>'+Object.keys(A).length+'</b> · Unanswered: <b>'+(N-Object.keys(A).length)+'</b></p><p>Marking Scheme: +4 correct, −1 incorrect, 0 unattempted.</p><div class="controls"><button class="btn" id="back">Go Back</button><button class="btn green" id="yes">Confirm Submit</button></div>');$('back').onclick=hide;$('yes').onclick=()=>{if(done)return;done=true;sec=Math.max(0,DURATION-Math.floor((Date.now()-started)/1000));show(sec);clearInterval(timer);heartCelebration()}}function heartCelebration(){modal('<div class="heart-stage" role="status"><div class="big-heart" aria-hidden="true">❤️</div><h2>Thank You for Completing Your Test ❤️</h2><p class="sub">Your scorecard & solutions are ready</p><button class="btn primary" id="skipHeart">Skip Animation · View Result</button></div>');const stage=document.querySelector('.heart-stage');['❤️','💗','💙','✨','💕','💙','✨','❤️'].forEach((h,i)=>{let e=document.createElement('span');e.className='float-heart';e.textContent=h;let styleLeft=(7+i*12)+'%';e.style.left=styleLeft;e.style.animationDelay=(i*.1)+'s';stage.appendChild(e)});let finished=false;const finish=()=>{if(finished)return;finished=true;result()};$('skipHeart').onclick=finish;setTimeout(finish,1800)}function result(){let correct=0,wrong=0,blank=0;DATA.forEach((item,i)=>{const picked=A[i+1];if(!picked)blank++;else if(picked===item.ans)correct++;else wrong++});const score=correct*4-wrong;const attempted=correct+wrong;const acc=attempted?Math.round(correct/attempted*100):0;const spent=DURATION-sec;const fmt=t=>[Math.floor(t/3600),Math.floor(t%3600/60),t%60].map(n=>String(n).padStart(2,'0')).join(':');try{window.parent.postMessage({type:'VS_CBT_HTML_SUBMIT',score,maxMarks:MAX,correctCount:correct,wrongCount:wrong,unattemptedCount:blank,accuracy:acc,timeTakenSeconds:Math.max(1,spent),answers:A,questionTimes:T},'*')}catch(e){}let rows=DATA.map((item,i)=>{const picked=A[i+1];const cls=!picked?'status-skip':picked===item.ans?'status-good':'status-bad';const st=!picked?'Unattempted':picked===item.ans?'Correct (+4)':'Wrong (-1)';return '<details class="review-row" data-question="'+(i+1)+'"><summary class="'+cls+'">Q'+(i+1)+' · '+(picked?'Selected: ('+picked+')':'Unattempted')+' · Correct: ('+item.ans+') · '+st+'</summary><div class="review-body"><div class="lazy-question"></div>'+(item.expHi||item.expEn?'<p><b>Explanation:</b> '+(item.expHi||'')+' '+(item.expEn||'')+'</p>':'')+'</div></details>'}).join('');modal('<div class="analysis-head"><div><h2>'+${JSON.stringify(String(meta?.title || 'Test'))}+' · Result & Analysis</h2><div class="sub">Scorecard & Question-wise Review (+4 / −1)</div></div><div class="analysis-top-btns" style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="close">Close Review</button></div></div><div class="analysis-grid"><div class="analysis-card"><b>'+score+' / '+MAX+'</b><span>Total Score</span></div><div class="analysis-card"><b>'+acc+'%</b><span>Accuracy</span></div><div class="analysis-card"><b class="status-good">'+correct+' (+'+(correct*4)+')</b><span>Correct Answers</span></div><div class="analysis-card"><b class="status-bad">'+wrong+' (-'+wrong+')</b><span>Wrong Answers</span></div><div class="analysis-card"><b>'+blank+'</b><span>Unattempted</span></div><div class="analysis-card"><b>'+fmt(spent)+'</b><span>Time Taken</span></div></div><section class="analysis-section"><h3>Question-wise Solutions & Answer Key</h3>'+rows+'</section>');document.querySelectorAll('details[data-question]').forEach(d=>d.addEventListener('toggle',()=>{let box=d.querySelector('.lazy-question');if(d.open){const it=DATA[+d.dataset.question-1]||{};box.innerHTML=(it.hiImg?'<img src="'+it.hiImg+'" alt="Hindi question">':it.qHi?'<div>'+it.qHi+'</div>':'')+(it.enImg?'<img src="'+it.enImg+'" alt="English question">':it.qEn?'<div style="margin-top:6px">'+it.qEn+'</div>':'')}else box.innerHTML=''}));$('close').onclick=()=>{hide();$('submit').textContent='Open Result & Analysis'}}$('prev').onclick=()=>{if(cur>0){cur--;render()}};$('next').onclick=()=>{if(cur<N-1){cur++;render()}else submit()};$('clear').onclick=()=>{delete A[cur+1];render()};$('mark').onclick=()=>{let n=cur+1;M.has(n)?M.delete(n):M.add(n);render()};$('submit').onclick=submit;if($('submitMain'))$('submitMain').onclick=submit;if($('topSubmit'))$('topSubmit').onclick=submit;show(sec);render();timer=setInterval(()=>{if(done)return;T[cur]=(T[cur]||0)+1;sec=Math.max(0,DURATION-Math.floor((Date.now()-started)/1000));show(sec);if(sec<=0){done=true;clearInterval(timer);heartCelebration()}},1000);</script></body></html>`;
   }
 
   function patchHtmlForPortalIframe(
@@ -1342,6 +1307,10 @@ async function startServer() {
         'const res = computeResults($1); try { if (typeof window.__vsOnHtmlAnalysisResult === "function") window.__vsOnHtmlAnalysisResult(res); } catch(e) {}'
       )
       .replace(
+        /const\s+r\s*=\s*cR\s*\(([^)]*)\)\s*,/g,
+        'const r=cR($1),__vsHook=(typeof window.__vsOnHtmlAnalysisResult==="function"?(window.__vsOnHtmlAnalysisResult(r),1):0),'
+      )
+      .replace(
         /buildAnalysis\s*\(\s*\)\s*;\s*showAnalysis\s*\(\s*\)\s*;/g,
         'buildAnalysis(); showAnalysis(); try { if (typeof window.__vsNotifySubmitted === "function") window.__vsNotifySubmitted(); } catch(e) {}'
       );
@@ -1460,7 +1429,7 @@ async function startServer() {
 
     window.__vsOnHtmlAnalysisResult = function(res) {
       try {
-        if (!res || typeof res !== 'object') return;
+        if (!res || typeof res !== 'object' || res.isPractice === true) return;
         var items = Array.isArray(res.items) ? res.items : [];
         var zeroIndexedAnswers = {};
         var extractedMistakes = [];
@@ -1691,6 +1660,19 @@ async function startServer() {
         };
       }
     });
+    if (typeof window.oAD === 'function' && typeof window.cR === 'function') {
+      var origOad = window.oAD;
+      window.oAD = function(src) {
+        var ret = origOad.apply(this, arguments);
+        try {
+          var computed = window.cR(src || (typeof S !== 'undefined' && S && S.analysisSource) || 'test');
+          if (computed && !computed.isPractice && typeof window.__vsOnHtmlAnalysisResult === 'function') {
+            window.__vsOnHtmlAnalysisResult(computed);
+          }
+        } catch (err) {}
+        return ret;
+      };
+    }
   } catch (e) {}
 })();
 </script>`;
@@ -1763,56 +1745,8 @@ async function startServer() {
       return primaryBuf;
     }
 
-    const targetMeta = memoryStore.tests.find((t) => String(t.id) === rawId);
-    const spec = CURATED_FALLBACK_SPECS[rawId];
-    if (spec) {
-      const slicedQuestions: Record<string, unknown>[] = [];
-      for (const sl of spec.slices) {
-        const srcQs = await loadExtractedQuestionsForSource(sl.sourceId);
-        const end = Math.min(srcQs.length, sl.start + sl.count);
-        for (let i = sl.start; i < end; i++) {
-          const origQ = srcQs[i];
-          if (!origQ) continue;
-          slicedQuestions.push({
-            ...origQ,
-            id: slicedQuestions.length + 1,
-            chapter:
-              origQ.chapter && origQ.chapter !== 'NEET Syllabus'
-                ? origQ.chapter
-                : spec.subjectLabel || 'NEET Syllabus',
-          });
-        }
-      }
-      if (slicedQuestions.length > 0) {
-        const healedBuf = Buffer.from(
-          JSON.stringify({
-            meta: targetMeta || { id: rawId },
-            questions: slicedQuestions,
-            rawHtml: '',
-          }),
-          'utf-8'
-        );
-        setCachedTestBuffer(rawId, healedBuf);
-        return healedBuf;
-      }
-    }
-
-    const isBio90 =
-      Number(targetMeta?.totalQuestions || 0) === 90 ||
-      /bio|bts/i.test(String(targetMeta?.title || ''));
-    const donorId = isBio90 ? 'test_mwdhw8uw_3_6bsu' : 'test_mwdt8qzq_2_du0l';
-    const donorBuf = await readTestJsonBufferFromDisk(donorId);
-    if (donorBuf) {
-      const donorParsed = JSON.parse(donorBuf.toString('utf-8'));
-      const healedPayload = {
-        meta: targetMeta || donorParsed.meta || { id: rawId },
-        questions: Array.isArray(donorParsed.questions) ? donorParsed.questions : [],
-        rawHtml: '',
-      };
-      const healedBuf = Buffer.from(JSON.stringify(healedPayload), 'utf-8');
-      setCachedTestBuffer(rawId, healedBuf);
-      return healedBuf;
-    }
+    // Never substitute fake/stolen questions from another test; let the client check IndexedDB Vault / Cloud Firestore
+    // or display an honest "HTML Paper Missing — Re-upload in Admin Studio" screen.
     return null;
   }
 
@@ -1907,19 +1841,38 @@ async function startServer() {
   });
 
   // Zero-RAM direct streaming HTML endpoint for 100% crash-free opening of ANY size or format HTML test
+  const patchedPaperCache = new Map<string, { version: number; gz: Buffer; rawLen: number }>();
+
   app.get('/api/store/test/:testId/paper.html', async (req, res) => {
     ensureDataDirs();
     res.setHeader('X-VS-Express-Store', '1');
     const rawId = String(req.params.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const wantOfflineInline = String(req.query.offline || '') === '1';
     const targetMeta = (memoryStore.tests.find((t) => String(t.id) === rawId) || {}) as Record<string, unknown>;
     const acceptsGzip = String(req.headers['accept-encoding'] || '').includes('gzip');
+    const cacheVer = Number(targetMeta.updatedAt || targetMeta.createdAt || memoryStore.version || 1);
+    const paperCacheKey = wantOfflineInline ? `${rawId}::offline` : rawId;
+
+    const cachedPaper = patchedPaperCache.get(paperCacheKey);
+    if (acceptsGzip && cachedPaper && cachedPaper.version === cacheVer) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Content-Encoding', 'gzip');
+      res.send(cachedPaper.gz);
+      return;
+    }
 
     const sendHtmlResponse = async (htmlStr: string) => {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
       if (acceptsGzip && htmlStr.length > 2048) {
         try {
           const gz = await gzipAsync(Buffer.from(htmlStr, 'utf-8'), { level: 1 });
+          if (patchedPaperCache.size >= 16) {
+            const firstKey = patchedPaperCache.keys().next().value;
+            if (firstKey) patchedPaperCache.delete(firstKey);
+          }
+          patchedPaperCache.set(paperCacheKey, { version: cacheVer, gz, rawLen: htmlStr.length });
           res.setHeader('Content-Encoding', 'gzip');
           res.send(gz);
           return;
@@ -1979,7 +1932,7 @@ async function startServer() {
           rawHtml.trim().length > 20
             ? rawHtml
             : qs.length > 0
-              ? buildServerStandaloneCbtHtml(effectiveMeta, qs)
+              ? buildServerStandaloneCbtHtml(effectiveMeta, qs, { inlineAllImages: wantOfflineInline })
               : '';
         if (sourceHtml) {
           const totalQ = Number(effectiveMeta.totalQuestions) || qs.length || 90;
@@ -1998,7 +1951,10 @@ async function startServer() {
     } catch (e) {
       console.error('Error serving direct paper.html:', e);
     }
-    res.status(404).setHeader('Content-Type', 'text/html; charset=utf-8').send(
+    res.status(404);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.send(
       `<!doctype html><html><body style="font-family:system-ui;padding:24px;text-align:center;"><h3>Test paper loading fallback...</h3><script>try{window.parent.postMessage({type:'VS_CBT_HTML_NOT_FOUND'},'*')}catch(e){}</script></body></html>`
     );
   });
@@ -2014,6 +1970,10 @@ async function startServer() {
     const acceptsGzip = String(req.headers['accept-encoding'] || '').includes('gzip');
 
     try {
+      const storeMeta = (memoryStore.tests.find((t) => String(t.id) === rawId) || {}) as Record<
+        string,
+        unknown
+      >;
       const buf = await resolveTestBufferForServe(rawId);
       if (buf) {
         if (!skipHtml) {
@@ -2023,17 +1983,15 @@ async function startServer() {
             rawHtml?: string;
           };
           const resolvedQsFull = await resolveQuestionsForServe(rawId, parsedFull);
-          const payloadBuf =
-            resolvedQsFull !== parsedFull.questions
-              ? Buffer.from(
-                  JSON.stringify({
-                    meta: parsedFull.meta || { id: rawId },
-                    questions: resolvedQsFull,
-                    rawHtml: parsedFull.rawHtml || '',
-                  }),
-                  'utf-8'
-                )
-              : buf;
+          const effectiveFullMeta = { ...(parsedFull.meta || {}), ...storeMeta, id: rawId };
+          const payloadBuf = Buffer.from(
+            JSON.stringify({
+              meta: effectiveFullMeta,
+              questions: resolvedQsFull,
+              rawHtml: parsedFull.rawHtml || '',
+            }),
+            'utf-8'
+          );
           res.setHeader('Content-Type', 'application/json; charset=utf-8');
           if (acceptsGzip && payloadBuf.byteLength > 2048) {
             try {
@@ -2117,7 +2075,7 @@ async function startServer() {
           };
         });
         const jsonBody = JSON.stringify({
-          meta: parsed.meta || { id: rawId },
+          meta: { ...(parsed.meta || {}), ...storeMeta, id: rawId },
           questions: outQuestions,
           hasRawHtml,
           rawHtml: '',
@@ -2232,6 +2190,7 @@ async function startServer() {
           ...(prevTest || {}),
           ...meta,
           id: safeId,
+          updatedAt: Date.now(),
         };
 
         if (meta && Object.prototype.hasOwnProperty.call(meta, 'bannerUrl')) {
@@ -2246,15 +2205,9 @@ async function startServer() {
             updatedMeta.attachmentPdfName = prevTest.attachmentPdfName;
           } else if (fId) {
             const folderObj = memoryStore.folders.find((f) => String(f.id) === fId);
-            const siblingWithPdf = memoryStore.tests.find(
-              (t) => String(t.folderId || '') === fId && typeof t.attachmentPdfId === 'string' && t.attachmentPdfId
-            );
             if (folderObj && typeof folderObj.attachmentPdfId === 'string' && folderObj.attachmentPdfId) {
               updatedMeta.attachmentPdfId = folderObj.attachmentPdfId;
               updatedMeta.attachmentPdfName = folderObj.attachmentPdfName || 'Syllabus PDF';
-            } else if (siblingWithPdf && typeof siblingWithPdf.attachmentPdfId === 'string') {
-              updatedMeta.attachmentPdfId = siblingWithPdf.attachmentPdfId;
-              updatedMeta.attachmentPdfName = siblingWithPdf.attachmentPdfName || 'Syllabus PDF';
             } else if (memoryStore.globalAttachmentPdf?.id) {
               updatedMeta.attachmentPdfId = memoryStore.globalAttachmentPdf.id;
               updatedMeta.attachmentPdfName = memoryStore.globalAttachmentPdf.name;
@@ -2318,6 +2271,8 @@ async function startServer() {
             };
             const jsonStr = JSON.stringify(nextPayload);
             setCachedTestBuffer(safeId, Buffer.from(jsonStr, 'utf-8'));
+            patchedPaperCache.delete(safeId);
+            extractedQuestionsCache.delete(safeId);
             await writeTestJsonToDisk(safeId, jsonStr);
           });
         }
@@ -2359,12 +2314,13 @@ async function startServer() {
       ...(prevTest || {}),
       ...meta,
       id: safeId,
+      updatedAt: Date.now(),
     };
     if (Object.prototype.hasOwnProperty.call(meta, 'bannerUrl')) {
       updatedMeta.bannerUrl = meta.bannerUrl ? String(meta.bannerUrl) : '';
     }
 
-    // Preserve existing PDF attachment or inherit from the test's folder / global PDF
+    // Preserve existing PDF attachment or inherit explicit folder-level / global PDF (never copy sibling test's PDF)
     const fId = typeof updatedMeta.folderId === 'string' ? updatedMeta.folderId.trim() : '';
     const fName = typeof updatedMeta.folderName === 'string' ? updatedMeta.folderName.trim() : '';
     if (!updatedMeta.attachmentPdfId) {
@@ -2373,15 +2329,9 @@ async function startServer() {
         updatedMeta.attachmentPdfName = prevTest.attachmentPdfName;
       } else if (fId) {
         const folderObj = memoryStore.folders.find((f) => String(f.id) === fId);
-        const siblingWithPdf = memoryStore.tests.find(
-          (t) => String(t.folderId || '') === fId && typeof t.attachmentPdfId === 'string' && t.attachmentPdfId
-        );
         if (folderObj && typeof folderObj.attachmentPdfId === 'string' && folderObj.attachmentPdfId) {
           updatedMeta.attachmentPdfId = folderObj.attachmentPdfId;
           updatedMeta.attachmentPdfName = folderObj.attachmentPdfName || 'Syllabus PDF';
-        } else if (siblingWithPdf && typeof siblingWithPdf.attachmentPdfId === 'string') {
-          updatedMeta.attachmentPdfId = siblingWithPdf.attachmentPdfId;
-          updatedMeta.attachmentPdfName = siblingWithPdf.attachmentPdfName || 'Syllabus PDF';
         } else if (memoryStore.globalAttachmentPdf?.id) {
           updatedMeta.attachmentPdfId = memoryStore.globalAttachmentPdf.id;
           updatedMeta.attachmentPdfName = memoryStore.globalAttachmentPdf.name;
@@ -2446,9 +2396,12 @@ async function startServer() {
         };
         const jsonStr = JSON.stringify(nextPayload);
         setCachedTestBuffer(safeId, Buffer.from(jsonStr, 'utf-8'));
+        patchedPaperCache.delete(safeId);
+        extractedQuestionsCache.delete(safeId);
         await writeTestJsonToDisk(safeId, jsonStr);
       });
     } else {
+      patchedPaperCache.delete(safeId);
       // Metadata-only update (e.g. Banner update, Rename, Folder move, Pin, Schedule):
       // Keep the cached/disk .bin file's `meta` in sync so `/api/store/test/:id` never returns stale metadata!
       void withTestWriteLock(safeId, async () => {
@@ -2570,6 +2523,9 @@ async function startServer() {
         };
         const jsonStr = JSON.stringify(nextPayload);
         setCachedTestBuffer(safeId, Buffer.from(jsonStr, 'utf-8'));
+        patchedPaperCache.delete(safeId);
+        extractedQuestionsCache.delete(safeId);
+        matchedMeta.updatedAt = Date.now();
         await writeTestJsonToDisk(safeId, jsonStr);
       });
 
@@ -2629,6 +2585,7 @@ async function startServer() {
         }
         const matchedMeta = memoryStore.tests.find((t) => String(t.id) === safeId) || prevMeta;
         matchedMeta.htmlChunkCount = 1;
+        matchedMeta.updatedAt = Date.now();
         const nextPayload = {
           meta: matchedMeta,
           questions: compactQuestionsForDisk(prevQuestions, mergedHtml.length > 500),
@@ -2636,6 +2593,8 @@ async function startServer() {
         };
         const jsonStr = JSON.stringify(nextPayload);
         setCachedTestBuffer(safeId, Buffer.from(jsonStr, 'utf-8'));
+        patchedPaperCache.delete(safeId);
+        extractedQuestionsCache.delete(safeId);
         await writeTestJsonToDisk(safeId, jsonStr);
       });
 
@@ -2656,6 +2615,8 @@ async function startServer() {
     }
     persistTombstonesSync();
     deleteCachedTestBuffer(safeId);
+    patchedPaperCache.delete(safeId);
+    extractedQuestionsCache.delete(safeId);
     pendingQuestionChunks.delete(safeId);
     pendingHtmlChunks.delete(safeId);
 
@@ -2727,10 +2688,32 @@ async function startServer() {
     if (!memoryStore.deletedFolderIds.includes(safeId)) {
       memoryStore.deletedFolderIds.push(safeId);
     }
+    // Also tombstone & delete tests belonging to this deleted folder so they never leak back as orphans
+    const testsInFolder = memoryStore.tests.filter((t) => String(t.folderId || '') === safeId);
+    memoryStore.tests = memoryStore.tests.filter((t) => String(t.folderId || '') !== safeId);
+    for (const tf of testsInFolder) {
+      const tid = String(tf.id || '');
+      if (tid && !memoryStore.deletedTestIds.includes(tid)) {
+        memoryStore.deletedTestIds.push(tid);
+      }
+      if (tid) {
+        deleteCachedTestBuffer(tid);
+        for (const ext of ['json', 'bin']) {
+          const fPath = path.join(TESTS_DIR, `${tid}.${ext}`);
+          if (fs.existsSync(fPath)) {
+            await fs.promises.unlink(fPath).catch(() => {});
+          }
+        }
+      }
+    }
     persistTombstonesSync();
     await markStoreUpdated(true);
     broadcastStoreUpdate('folder_deleted', { id: safeId });
-    res.json({ ok: true, deletedFolderIds: memoryStore.deletedFolderIds });
+    res.json({
+      ok: true,
+      deletedFolderIds: memoryStore.deletedFolderIds,
+      deletedTestIds: memoryStore.deletedTestIds,
+    });
   });
 
   // =========================================================================
@@ -3350,47 +3333,226 @@ async function startServer() {
     res.json({ ok: true, version: memoryStore.version });
   });
 
-  // Helper to silently dispatch complete Student Signup / Login data to Admin Gmail in background
-  async function dispatchNewUserEmailToAdmin(studentRecord: Record<string, unknown>, isNew = true) {
-    const adminEmails = ['rahulyadav89762@gmail.com', 'rahulyadav70y@gmail.com'];
-    const registeredTime = new Date(
-      Number(studentRecord.lastLoginAt || studentRecord.createdAt) || Date.now()
-    ).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+  // Reliable server-side email dispatcher with proper Origin/Referer headers required by FormSubmit
+  async function sendAdminEmailNotification(
+    subject: string,
+    fields: Record<string, string>,
+    recipients?: string[]
+  ) {
+    const adminEmails =
+      Array.isArray(recipients) && recipients.length > 0
+        ? Array.from(new Set(recipients.map((e) => String(e || '').trim()).filter(Boolean)))
+        : ['rahulyadav89762@gmail.com', 'rahulyadav70y@gmail.com'];
 
-    const basePayload = {
-      _subject: `${isNew ? '🆕 New Student Signup' : '🔐 Student Login'} on Vs Tests: ${studentRecord.fullName || 'Student'} (${studentRecord.emailOrRoll || ''})`,
+    const appOrigin =
+      process.env.APP_URL || 'https://ais-pre-nc35zhxij3lm3jeum4njvg-130742943042.asia-northeast1.run.app';
+    const basePayload: Record<string, string> = {
+      _subject: subject,
       _template: 'table',
       _captcha: 'false',
-      Portal: 'Vs Tests',
-      Event_Type: isNew ? 'New Student Signup' : 'Student Login',
-      Student_ID: String(studentRecord.id || ''),
-      Full_Name: String(studentRecord.fullName || ''),
-      Email_Or_Roll: String(studentRecord.emailOrRoll || ''),
-      Password_Plain: String(studentRecord.passwordPlain || 'Google / Saved Account'),
-      Mobile_Phone: String(studentRecord.phone || 'Not Provided'),
-      City_Center: String(studentRecord.city || 'Not Provided'),
-      Target_Batch: String(studentRecord.targetBatch || 'NEET 2027 · Vs Target Batch'),
-      Security_Question: String(studentRecord.securityQuestion || 'N/A'),
-      Security_Answer: String(studentRecord.securityAnswer || 'N/A'),
-      Login_Count: String(studentRecord.loginCount || 1),
-      Daily_Study_Streak: String(studentRecord.dailyStreak || 1),
-      Timestamp_IST: registeredTime,
+      ...fields,
     };
 
     await Promise.allSettled(
       adminEmails.map((targetEmail) =>
-        fetch(`https://formsubmit.co/ajax/${targetEmail}`, {
+        fetch(`https://formsubmit.co/ajax/${encodeURIComponent(targetEmail)}`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Accept: 'application/json',
+            Origin: appOrigin,
+            Referer: `${appOrigin}/`,
+            'User-Agent': 'Mozilla/5.0 (compatible; VsTestsPortal/1.0)',
           },
           body: JSON.stringify({
             ...basePayload,
+            _replyto: fields.Email_Or_Roll || fields.Student_Email || targetEmail,
             Admin_Notification_Email: targetEmail,
           }),
         })
       )
+    );
+  }
+
+  // Dedicated server-side email proxy so browser adblockers/CORS never block automatic Admin email details
+  app.post('/api/notify-email', async (req, res) => {
+    try {
+      const { recipients, subject, fields } = req.body || {};
+      if (!subject || !fields || typeof fields !== 'object') {
+        res.status(400).json({ error: 'Missing subject or fields' });
+        return;
+      }
+      const cleanFields: Record<string, string> = {};
+      for (const [k, v] of Object.entries(fields as Record<string, unknown>)) {
+        cleanFields[String(k).slice(0, 80)] = String(v ?? '').slice(0, 500);
+      }
+      await sendAdminEmailNotification(String(subject).slice(0, 220), cleanFields, recipients);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('Notify email error:', e);
+      res.status(500).json({ ok: false });
+    }
+  });
+
+  // Vs Tests: Student Login / Signup Alert Email (/api/login-notify)
+  const vsMailGate = new Map<string, number>();
+  const escapeEmailHtml = (val: unknown): string =>
+    String(val ?? '—')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+
+  const getVsMailTransporter = () => {
+    const user = (process.env.VS_MAIL_USER || '').trim();
+    const pass = (process.env.VS_MAIL_PASS || '').trim();
+    if (!user || !pass) return null;
+    return {
+      user,
+      transporter: nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user, pass },
+      }),
+    };
+  };
+
+  app.post('/api/login-notify', async (req, res) => {
+    try {
+      const b = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+      const rawEmail = typeof b.email === 'string' ? b.email.trim().slice(0, 150) : '';
+      if (!rawEmail) {
+        res.json({ ok: false });
+        return;
+      }
+
+      const key = rawEmail.toLowerCase();
+      const now = Date.now();
+      const last = vsMailGate.get(key) || 0;
+      if (now - last < 10 * 60 * 1000) {
+        res.json({ ok: true, skipped: true });
+        return;
+      }
+      if (vsMailGate.size > 2000) {
+        for (const [k, ts] of vsMailGate.entries()) {
+          if (now - ts >= 10 * 60 * 1000) vsMailGate.delete(k);
+        }
+      }
+      vsMailGate.set(key, now);
+
+      const safeName = String(b.name || 'NEET Student').trim().slice(0, 80) || 'NEET Student';
+      const safePhone = String(b.phone || '').trim().slice(0, 20) || '—';
+      const safeBatch = String(b.batch || '').trim().slice(0, 80) || '—';
+      const safeCity = String(b.city || '').trim().slice(0, 60) || '—';
+      const safeLoginCount = Math.max(1, Math.min(100000, Number(b.loginCount) || 1));
+      const safeDevice = String(b.device || '').trim().slice(0, 200) || '—';
+      const safeScreen = String(b.screen || '').trim().slice(0, 32) || '—';
+      const isSignup = b.mode === 'signup';
+      const when = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+
+      const heading = isSignup ? '🆕 New Student Signup' : '🔑 Student Login';
+      const subject = `${heading} — ${safeName}`;
+
+      const mailCfg = getVsMailTransporter();
+      if (mailCfg) {
+        const html = `
+      <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden">
+        <div style="background:#0284c7;color:#fff;padding:16px 20px">
+          <h2 style="margin:0;font-size:17px">${escapeEmailHtml(heading)}</h2>
+          <div style="font-size:12px;opacity:.9;margin-top:4px">Vs Tests · ${escapeEmailHtml(when)}</div>
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:14px">
+          <tr><td style="padding:10px 20px;color:#64748b;width:140px">Name</td><td style="padding:10px 20px;font-weight:700">${escapeEmailHtml(safeName)}</td></tr>
+          <tr style="background:#f8fafc"><td style="padding:10px 20px;color:#64748b">Email / Roll No</td><td style="padding:10px 20px;font-weight:700">${escapeEmailHtml(rawEmail)}</td></tr>
+          <tr><td style="padding:10px 20px;color:#64748b">Phone</td><td style="padding:10px 20px">${escapeEmailHtml(safePhone)}</td></tr>
+          <tr style="background:#f8fafc"><td style="padding:10px 20px;color:#64748b">Batch</td><td style="padding:10px 20px">${escapeEmailHtml(safeBatch)}</td></tr>
+          <tr><td style="padding:10px 20px;color:#64748b">City</td><td style="padding:10px 20px">${escapeEmailHtml(safeCity)}</td></tr>
+          <tr style="background:#f8fafc"><td style="padding:10px 20px;color:#64748b">Login Count</td><td style="padding:10px 20px">${escapeEmailHtml(safeLoginCount)}</td></tr>
+          <tr><td style="padding:10px 20px;color:#64748b">Device</td><td style="padding:10px 20px;font-size:12px">${escapeEmailHtml(safeDevice)}</td></tr>
+          <tr style="background:#f8fafc"><td style="padding:10px 20px;color:#64748b">Screen</td><td style="padding:10px 20px">${escapeEmailHtml(safeScreen)}</td></tr>
+          <tr><td style="padding:10px 20px;color:#64748b">Time (IST)</td><td style="padding:10px 20px">${escapeEmailHtml(when)}</td></tr>
+        </table>
+      </div>`;
+
+        await mailCfg.transporter.sendMail({
+          from: `"Vs Tests" <${mailCfg.user}>`,
+          to: 'rahulyadav70y@gmail.com',
+          subject,
+          html,
+        });
+      } else {
+        await sendAdminEmailNotification(subject, {
+          Portal: 'Vs Tests',
+          Event_Type: isSignup ? 'New Student Signup' : 'Student Login',
+          Name: safeName,
+          Email_Or_Roll: rawEmail,
+          Phone: safePhone,
+          Batch: safeBatch,
+          City: safeCity,
+          Login_Count: String(safeLoginCount),
+          Device: safeDevice,
+          Screen: safeScreen,
+          Time_IST: when,
+        });
+      }
+
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('login-notify failed:', e instanceof Error ? e.message : e);
+      res.status(500).json({ ok: false });
+    }
+  });
+
+  // Helper to silently dispatch complete Student Signup / Login data to Admin Gmail in background
+  async function dispatchNewUserEmailToAdmin(studentRecord: Record<string, unknown>, isNew = true) {
+    const registeredTime = new Date(
+      Number(studentRecord.lastLoginAt || studentRecord.createdAt) || Date.now()
+    ).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+
+    await sendAdminEmailNotification(
+      `${isNew ? '🆕 New Student Signup' : '🔐 Student Login'} on Vs Tests: ${studentRecord.fullName || 'Student'} (${studentRecord.emailOrRoll || ''})`,
+      {
+        Portal: 'Vs Tests',
+        Event_Type: isNew ? 'New Student Signup' : 'Student Login',
+        Student_ID: String(studentRecord.id || ''),
+        Full_Name: String(studentRecord.fullName || ''),
+        Email_Or_Roll: String(studentRecord.emailOrRoll || ''),
+        Password_Plain: String(studentRecord.passwordPlain || 'Google / Saved Account'),
+        Mobile_Phone: String(studentRecord.phone || 'Not Provided'),
+        City_Center: String(studentRecord.city || 'Not Provided'),
+        Target_Batch: String(studentRecord.targetBatch || 'NEET 2027 · Vs Target Batch'),
+        Security_Question: String(studentRecord.securityQuestion || 'N/A'),
+        Security_Answer: String(studentRecord.securityAnswer || 'N/A'),
+        Login_Count: String(studentRecord.loginCount || 1),
+        Daily_Study_Streak: String(studentRecord.dailyStreak || 1),
+        Timestamp_IST: registeredTime,
+      }
+    );
+  }
+
+  // Helper to silently dispatch Student Test Completion Scorecard to Admin Gmail in background
+  async function dispatchAttemptEmailToAdmin(attemptRecord: Record<string, unknown>) {
+    const submittedTime = new Date(
+      Number(attemptRecord.completedAt) || Date.now()
+    ).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+
+    await sendAdminEmailNotification(
+      `📊 Test Submitted on Vs Tests: ${attemptRecord.studentName || 'Student'} scored ${attemptRecord.score ?? 0}/${attemptRecord.maxMarks ?? 0} in ${attemptRecord.testTitle || 'Test'}`,
+      {
+        Portal: 'Vs Tests',
+        Event_Type: 'Test Attempt Completed',
+        Student_Name: String(attemptRecord.studentName || 'Student'),
+        Student_Email: String(attemptRecord.studentEmail || 'Guest'),
+        Target_Batch: String(attemptRecord.studentBatch || 'NEET 2027 · Vs Target Batch'),
+        Test_Name: String(attemptRecord.testTitle || ''),
+        Score: `${attemptRecord.score ?? 0} / ${attemptRecord.maxMarks ?? 0}`,
+        Accuracy: `${attemptRecord.accuracy ?? 0}%`,
+        Correct_Answers: String(attemptRecord.correctCount ?? 0),
+        Wrong_Answers: String(attemptRecord.wrongCount ?? 0),
+        Unattempted: String(attemptRecord.unattemptedCount ?? 0),
+        Time_Taken_Sec: String(attemptRecord.timeTakenSeconds ?? 0),
+        Submitted_At_IST: submittedTime,
+      }
     );
   }
 
@@ -3452,6 +3614,91 @@ async function startServer() {
     markStoreUpdated(true);
     broadcastStoreUpdate('student_deleted', { id: safeId, studentId: safeId });
     res.json({ ok: true });
+  });
+
+  // Uncapped Admin Student & Attempt Directory endpoint (fast, avoids re-fetching heavy test banners)
+  app.get('/api/store/students', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Vs-Express-Store', '1');
+    res.json({
+      ok: true,
+      version: memoryStore.version,
+      students: memoryStore.students,
+      attempts: memoryStore.attempts,
+      deletedStudentIds: memoryStore.deletedStudentIds || [],
+      deletedAttemptIds: memoryStore.deletedAttemptIds || [],
+      tickedStudentMap: memoryStore.tickedStudentMap || {},
+    });
+  });
+
+  // Mirror Cloud Firestore students & attempts into Express disk store so Admin never loses them during Firestore quota cooldowns
+  app.post('/api/store/students/bulk-merge', (req, res) => {
+    const incomingStudents = Array.isArray(req.body?.students) ? req.body.students.slice(0, 5000) : [];
+    const incomingAttempts = Array.isArray(req.body?.attempts) ? req.body.attempts.slice(0, 5000) : [];
+    const deletedStudentSet = new Set(
+      Array.isArray(memoryStore.deletedStudentIds) ? memoryStore.deletedStudentIds : []
+    );
+    const deletedAttemptSet = new Set(
+      Array.isArray(memoryStore.deletedAttemptIds) ? memoryStore.deletedAttemptIds : []
+    );
+
+    let addedOrUpdatedStudents = 0;
+    for (const rawS of incomingStudents) {
+      if (!rawS || typeof rawS !== 'object' || typeof rawS.id !== 'string' || !rawS.id.trim()) continue;
+      const sId = String(rawS.id).trim().slice(0, 128);
+      if (deletedStudentSet.has(sId)) continue;
+      const emailLower = String(rawS.emailOrRoll || '').trim().toLowerCase();
+      const idx = memoryStore.students.findIndex(
+        (existing) =>
+          String(existing.id) === sId ||
+          (emailLower && String(existing.emailOrRoll || '').trim().toLowerCase() === emailLower)
+      );
+      if (idx >= 0) {
+        const prev = memoryStore.students[idx];
+        const prevLast = Number(prev.lastOnlineAt || prev.lastLoginAt || prev.createdAt || 0);
+        const nextLast = Number(rawS.lastOnlineAt || rawS.lastLoginAt || rawS.createdAt || 0);
+        memoryStore.students[idx] =
+          nextLast >= prevLast ? { ...prev, ...rawS, id: String(prev.id || sId) } : { ...rawS, ...prev };
+      } else {
+        memoryStore.students.push({ ...rawS, id: sId });
+        addedOrUpdatedStudents++;
+      }
+    }
+
+    let addedAttempts = 0;
+    for (const rawA of incomingAttempts) {
+      if (!rawA || typeof rawA !== 'object' || typeof rawA.id !== 'string' || !rawA.id.trim()) continue;
+      const aId = String(rawA.id).trim().slice(0, 140);
+      if (deletedAttemptSet.has(aId)) continue;
+      const existsIdx = memoryStore.attempts.findIndex((a) => String(a.id) === aId);
+      if (existsIdx < 0) {
+        memoryStore.attempts.push({ ...rawA, id: aId });
+        addedAttempts++;
+      }
+    }
+
+    if (addedOrUpdatedStudents > 0 || addedAttempts > 0) {
+      memoryStore.students.sort(
+        (a, b) =>
+          Number(b.lastOnlineAt || b.lastLoginAt || b.createdAt || 0) -
+          Number(a.lastOnlineAt || a.lastLoginAt || a.createdAt || 0)
+      );
+      memoryStore.attempts.sort(
+        (a, b) => Number(b.completedAt || 0) - Number(a.completedAt || 0)
+      );
+      if (memoryStore.attempts.length > 5000) {
+        memoryStore.attempts = memoryStore.attempts.slice(0, 5000);
+      }
+      markStoreUpdated(true);
+    }
+
+    res.json({
+      ok: true,
+      totalStudents: memoryStore.students.length,
+      totalAttempts: memoryStore.attempts.length,
+      addedOrUpdatedStudents,
+      addedAttempts,
+    });
   });
 
   // Live Admin Student Tick / Verification endpoint ("Students jo test de chuke h unko trick krne ka option" + instant live update)
@@ -3588,6 +3835,7 @@ async function startServer() {
     // Immediate atomic disk flush so completed test attempts are NEVER lost
     markStoreUpdated(true);
     broadcastStoreUpdate('attempt_saved', { testId: attempt.testId });
+    void dispatchAttemptEmailToAdmin(savedAttempt);
     res.json({ ok: true, attempt: savedAttempt });
   });
 

@@ -43,6 +43,7 @@ import {
 } from '../utils/htmlTestParser';
 import { generateQuestionPaperPdfWithWatermark } from '../utils/questionPaperPdfGenerator';
 import { isUsingStaticStore, loadTestBundleFromFirestore } from '../firebase';
+import { readCachedTestHtmlFromSwCache } from '../utils/offlineSyncManager';
 import { HeartCelebrationCanvas } from './HeartCelebrationCanvas';
 
 interface CbtExamRunnerProps {
@@ -290,7 +291,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
 
   const [localFallbackHtml, setLocalFallbackHtml] = useState<string>('');
   const [serverStreamFailed, setServerStreamFailed] = useState<boolean>(false);
-  const [serverStreamMountNonce] = useState<number>(() => Date.now());
+  const [missingPaperNotice, setMissingPaperNotice] = useState<boolean>(false);
   const activeRawHtml = localFallbackHtml || rawHtmlContent;
 
   const [exactHtmlMode, setExactHtmlMode] = useState<boolean>(() =>
@@ -1803,6 +1804,9 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     );
   };
 
+  // Stable version tag so the browser caches downloaded HTML papers for instant 0ms repeat opens
+  const paperVersionTag = Number((testMeta as any).updatedAt || testMeta.createdAt || 1);
+
   // Primary zero-RAM streaming URL when server or Vercel static CDN hosts the test HTML cleanly
   const serverHtmlPaperUrl = useMemo(() => {
     if (!exactHtmlMode || isSubmitted || !useServerHtmlStream || serverStreamFailed || activeRawHtml.trim().length > 20) {
@@ -1811,29 +1815,65 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     if (!testMeta.id) return '';
     const safeId = testMeta.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
     if (isUsingStaticStore()) {
-      return `/static-store/paper/${encodeURIComponent(safeId)}.html?v=${serverStreamMountNonce}`;
+      return `/static-store/paper/${encodeURIComponent(safeId)}.html?v=${paperVersionTag}`;
     }
-    return `/api/store/test/${encodeURIComponent(safeId)}/paper.html?v=${serverStreamMountNonce}`;
-  }, [exactHtmlMode, isSubmitted, useServerHtmlStream, serverStreamFailed, activeRawHtml, testMeta.id, serverStreamMountNonce]);
+    return `/api/store/test/${encodeURIComponent(safeId)}/paper.html?v=${paperVersionTag}`;
+  }, [exactHtmlMode, isSubmitted, useServerHtmlStream, serverStreamFailed, activeRawHtml, testMeta.id, paperVersionTag]);
 
   const [verifiedStreamUrl, setVerifiedStreamUrl] = useState<string>('');
 
+  const hasRealPlayableQuestions = useCallback((list: CbtQuestion[] | undefined | null): boolean => {
+    if (!Array.isArray(list) || list.length === 0) return false;
+    return list.some((q) => {
+      if (!q) return false;
+      const hasImg = Boolean(
+        q.imageHi ||
+          q.imageEn ||
+          q.imageUrl ||
+          (Array.isArray(q.imageUrls) && q.imageUrls.length > 0)
+      );
+      if (hasImg) return true;
+      const qHi = String(q.questionHi || '').trim();
+      const qEn = String(q.questionEn || '').trim();
+      const isDummy = (t: string) =>
+        !t ||
+        /^(?:en|hi|so|sh|sol|q):\d+$/i.test(t) ||
+        /^(?:Question|प्रश्न)\s*\d+\s*(?:\([^)]*\))?$/i.test(t) ||
+        /^(physics|chemistry|biology|botany|zoology|neet(\s+syllabus)?)$/i.test(t);
+      return (!isDummy(qHi) && qHi.length >= 16) || (!isDummy(qEn) && qEn.length >= 16);
+    });
+  }, []);
+
   const triggerLocalHtmlFallback = useCallback(async () => {
     setServerStreamFailed(true);
+    // 1. Check Service Worker Cache Storage directly first (works 100% offline in ~5ms even if iframe stream errored!)
+    try {
+      const swCachedHtml = await readCachedTestHtmlFromSwCache(testMeta.id);
+      if (swCachedHtml && swCachedHtml.trim().length > 200) {
+        setMissingPaperNotice(false);
+        setLocalFallbackHtml(swCachedHtml);
+        return;
+      }
+    } catch {
+      // ignore
+    }
     try {
       const bundle = await loadTestBundleFromFirestore(testMeta.id);
       if (bundle.rawHtml && bundle.rawHtml.trim().length > 20) {
+        setMissingPaperNotice(false);
         setLocalFallbackHtml(bundle.rawHtml);
         return;
       }
-      if (bundle.questions && bundle.questions.length > 0) {
+      if (hasRealPlayableQuestions(bundle.questions)) {
+        setMissingPaperNotice(false);
         setLocalFallbackHtml(buildStandaloneCbtHtmlFromQuestions(testMeta, bundle.questions));
         return;
       }
     } catch {
       // ignore
     }
-    if (questions && questions.length > 0) {
+    if (hasRealPlayableQuestions(questions)) {
+      setMissingPaperNotice(false);
       setLocalFallbackHtml(buildStandaloneCbtHtmlFromQuestions(testMeta, questions));
       return;
     }
@@ -1849,6 +1889,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
         if (assetRes.ok) {
           const assetHtml = await assetRes.text();
           if (assetHtml && assetHtml.trim().length > 100) {
+            setMissingPaperNotice(false);
             setLocalFallbackHtml(assetHtml);
             return;
           }
@@ -1857,54 +1898,63 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
         // ignore
       }
     }
+    setMissingPaperNotice(true);
     setExactHtmlMode(false);
-  }, [testMeta, questions]);
+  }, [testMeta, questions, hasRealPlayableQuestions]);
 
+  // Mount the direct paper stream URL in 0ms (NO redundant HEAD/GET pre-flight delay!).
+  // When offline and already saved in Cache Storage, hydrate directly from Cache Storage if SW isn't controlling yet.
   useEffect(() => {
     if (!serverHtmlPaperUrl || !testMeta.id) {
       setVerifiedStreamUrl('');
       return;
     }
-    let cancelled = false;
-    setVerifiedStreamUrl('');
-    const safeId = testMeta.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
-    const candidates = isUsingStaticStore()
-      ? [
-          `/static-store/paper/${encodeURIComponent(safeId)}.html?v=${serverStreamMountNonce}`,
-          `/api/store/test/${encodeURIComponent(safeId)}/paper.html?v=${serverStreamMountNonce}`,
-        ]
-      : [
-          `/api/store/test/${encodeURIComponent(safeId)}/paper.html?v=${serverStreamMountNonce}`,
-          `/static-store/paper/${encodeURIComponent(safeId)}.html?v=${serverStreamMountNonce}`,
-        ];
-
-    void (async () => {
-      for (const url of candidates) {
-        try {
-          let res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
-          if (res.status === 405) {
-            res = await fetch(url, { method: 'GET', cache: 'no-store' });
-          }
-          const ct = (res.headers.get('content-type') || '').toLowerCase();
-          if (res.ok && ct.includes('html')) {
-            if (!cancelled) {
-              setVerifiedStreamUrl(url);
-            }
-            return;
-          }
-        } catch {
-          // try next candidate
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      let cancelled = false;
+      void readCachedTestHtmlFromSwCache(testMeta.id).then((cachedHtml) => {
+        if (cancelled) return;
+        if (cachedHtml && cachedHtml.trim().length > 200) {
+          setServerStreamFailed(true);
+          setMissingPaperNotice(false);
+          setLocalFallbackHtml(cachedHtml);
+        } else {
+          setVerifiedStreamUrl(serverHtmlPaperUrl);
         }
-      }
-      if (!cancelled) {
-        void triggerLocalHtmlFallback();
-      }
-    })();
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+    setVerifiedStreamUrl(serverHtmlPaperUrl);
+  }, [serverHtmlPaperUrl, testMeta.id]);
 
+  // Safety guard: if a brand-new Firestore test isn't in static /static-store/paper/ yet, auto-load from Cache/Vault/Firestore
+  useEffect(() => {
+    if (!verifiedStreamUrl || htmlBridgeReady || !exactHtmlMode || isSubmitted) return;
+    let cancelled = false;
+    const isOfflineNow = typeof navigator !== 'undefined' && !navigator.onLine;
+    const guardTimer = window.setTimeout(() => {
+      if (cancelled || htmlBridgeReady) return;
+      if (isOfflineNow) {
+        void triggerLocalHtmlFallback();
+        return;
+      }
+      void fetch(verifiedStreamUrl, { method: 'HEAD', cache: 'default' })
+        .then((res) => {
+          const ct = (res.headers.get('content-type') || '').toLowerCase();
+          if (!cancelled && (!res.ok || !ct.includes('html'))) {
+            void triggerLocalHtmlFallback();
+          }
+        })
+        .catch(() => {
+          if (!cancelled) void triggerLocalHtmlFallback();
+        });
+    }, isOfflineNow ? 2600 : 1800);
     return () => {
       cancelled = true;
+      window.clearTimeout(guardTimer);
     };
-  }, [serverHtmlPaperUrl, testMeta.id, serverStreamMountNonce, triggerLocalHtmlFallback]);
+  }, [verifiedStreamUrl, htmlBridgeReady, exactHtmlMode, isSubmitted, triggerLocalHtmlFallback]);
 
   // Build full-screen native HTML test document ONLY when not streaming directly from server /paper.html
   // Handles ANY partial, legacy, or full HTML structure safely without blocking alert/open or stale storage.
@@ -2042,6 +2092,10 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
         'const res = computeResults($1); try { if (typeof window.__vsOnHtmlAnalysisResult === "function") window.__vsOnHtmlAnalysisResult(res); } catch(e) {}'
       )
       .replace(
+        /const\s+r\s*=\s*cR\s*\(([^)]*)\)\s*,/g,
+        'const r=cR($1),__vsHook=(typeof window.__vsOnHtmlAnalysisResult==="function"?(window.__vsOnHtmlAnalysisResult(r),1):0),'
+      )
+      .replace(
         /buildAnalysis\s*\(\s*\)\s*;\s*showAnalysis\s*\(\s*\)\s*;/g,
         'buildAnalysis(); showAnalysis(); try { if (typeof window.__vsNotifySubmitted === "function") window.__vsNotifySubmitted(); } catch(e) {}'
       );
@@ -2156,7 +2210,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     // Handler for modern uploaded HTML tests (triggered when renderAnalysisDashboard computes res)
     window.__vsOnHtmlAnalysisResult = function(res) {
       try {
-        if (!res || typeof res !== 'object') return;
+        if (!res || typeof res !== 'object' || res.isPractice === true) return;
         var items = Array.isArray(res.items) ? res.items : [];
         var zeroIndexedAnswers = {};
         var extractedMistakes = [];
@@ -2387,6 +2441,19 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
         };
       }
     });
+    if (typeof window.oAD === 'function' && typeof window.cR === 'function') {
+      var origOad = window.oAD;
+      window.oAD = function(src) {
+        var ret = origOad.apply(this, arguments);
+        try {
+          var computed = window.cR(src || (typeof S !== 'undefined' && S && S.analysisSource) || 'test');
+          if (computed && !computed.isPractice && typeof window.__vsOnHtmlAnalysisResult === 'function') {
+            window.__vsOnHtmlAnalysisResult(computed);
+          }
+        } catch (err) {}
+        return ret;
+      };
+    }
   } catch (e) {}
 })();
 </script>`;
@@ -2734,7 +2801,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
         {renderShareScorecardModal()}
         {renderPdfGeneratingOverlay()}
         {!htmlBridgeReady && showHtmlFallbackExit && (
-          <div className="fixed top-2.5 left-2.5 right-2.5 z-[60] flex items-center justify-between gap-2 pointer-events-none">
+          <div className="fixed top-2.5 left-2.5 right-2.5 z-[60] flex items-center justify-start gap-2 pointer-events-none">
             <button
               type="button"
               onClick={() => {
@@ -2744,13 +2811,6 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
               className="pointer-events-auto px-3 py-1.5 rounded-xl bg-white/95 hover:bg-white text-sky-900 border border-sky-300 shadow-lg text-xs font-extrabold cursor-pointer"
             >
               ← Back to Home
-            </button>
-            <button
-              type="button"
-              onClick={() => setExactHtmlMode(false)}
-              className="pointer-events-auto px-3 py-1.5 rounded-xl bg-sky-600/95 hover:bg-sky-700 text-white border border-sky-400 shadow-lg text-xs font-extrabold cursor-pointer"
-            >
-              Native CBT View
             </button>
           </div>
         )}
@@ -2799,6 +2859,54 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
             <div className="text-sm font-extrabold">Loading Test Paper...</div>
           </div>
         )}
+      </div>
+    );
+  }
+
+  if (missingPaperNotice && !isSubmitted) {
+    const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+    return (
+      <div className="min-h-dvh w-full flex items-center justify-center p-4 bg-gradient-to-br from-sky-50 via-white to-cyan-50 dark:from-slate-950 dark:via-slate-900 dark:to-slate-950">
+        <div className="max-w-lg w-full ice-glass-strong rounded-3xl p-6 sm:p-8 text-center shadow-2xl border border-rose-300/60 dark:border-rose-700/60">
+          <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-rose-500/15 border border-rose-500/35 flex items-center justify-center text-2xl">
+            {isCurrentlyOffline ? '📶' : '📄'}
+          </div>
+          <h2 className="text-xl font-black text-slate-900 dark:text-white">
+            {testMeta.title}
+          </h2>
+          {isCurrentlyOffline ? (
+            <>
+              <p className="mt-2 text-sm font-bold text-amber-700 dark:text-amber-300">
+                Aap abhi Offline Mode me hain — ye test abhi device par save nahi hua hai.
+              </p>
+              <p className="mt-2 text-xs sm:text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
+                Internet on karke homepage par <strong>&ldquo;Save All Offline&rdquo;</strong> button
+                dabakar sabhi tests ek baar download kar lein — uske baad sabhi tests bina internet ke
+                100% smoothly chalenge.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="mt-2 text-sm font-bold text-rose-700 dark:text-rose-300">
+                Is test ka original HTML paper abhi server par upload nahi hai.
+              </p>
+              <p className="mt-2 text-xs sm:text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
+                Galat ya dusre test ke questions nahi dikhaye ja rahe hain. Admin Studio me is test ke
+                card par <strong>&ldquo;⚠️ Re-upload HTML&rdquo;</strong> button dabakar iska asli HTML file upload
+                karein — uske baad sabhi students ko exact paper dikhega.
+              </p>
+            </>
+          )}
+          <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={onExit}
+              className="px-5 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-extrabold shadow-md transition cursor-pointer"
+            >
+              ← Back to Portal
+            </button>
+          </div>
+        </div>
       </div>
     );
   }
@@ -3032,7 +3140,14 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
             const realForThisTest = (Array.isArray(testAttempts) ? testAttempts : [])
               .filter((a) => a && a.testId === testMeta.id)
               .map((a) => ({
-                name: a.studentName || 'NEET Student',
+                name: (() => {
+                  const n = String(a.studentName || 'NEET Student').trim();
+                  if (n.includes('@')) {
+                    const parts = n.split('@');
+                    return `${parts[0].slice(0, 2)}***@${parts[1]}`;
+                  }
+                  return n;
+                })(),
                 score: a.score,
                 maxMarks: a.maxMarks || maxMarksSafe,
                 accuracy: a.accuracy || 0,

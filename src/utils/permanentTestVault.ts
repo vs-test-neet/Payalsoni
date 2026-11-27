@@ -263,6 +263,35 @@ export async function getVaultTestHtml(testId: string): Promise<string> {
   });
 }
 
+export async function getAllVaultHtmlIds(): Promise<Set<string>> {
+  const db = await openVaultDb();
+  if (!db) return new Set();
+
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_HTML, 'readonly');
+      const store = tx.objectStore(STORE_HTML);
+      if (typeof store.getAllKeys === 'function') {
+        const req = store.getAllKeys();
+        req.onsuccess = () => {
+          const keys = Array.isArray(req.result) ? req.result.map((k) => String(k || '')).filter(Boolean) : [];
+          resolve(new Set(keys));
+        };
+        req.onerror = () => resolve(new Set());
+      } else {
+        const req = store.getAll();
+        req.onsuccess = () => {
+          const list = Array.isArray(req.result) ? req.result : [];
+          resolve(new Set(list.map((d: { id?: string }) => String(d?.id || '')).filter(Boolean)));
+        };
+        req.onerror = () => resolve(new Set());
+      }
+    } catch {
+      resolve(new Set());
+    }
+  });
+}
+
 export async function markTestDeletedInVault(testId: string): Promise<void> {
   const db = await openVaultDb();
   if (!db || !testId) return;

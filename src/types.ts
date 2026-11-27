@@ -78,7 +78,9 @@ export interface CbtTestMeta {
   attachmentPdfName?: string;
   isPdfOnly?: boolean;
   createdAt: number;
+  updatedAt?: number;
   lastPlayedAt?: number;
+  hasPlayablePaper?: boolean;
 }
 
 export interface GlobalAttachmentPdf {

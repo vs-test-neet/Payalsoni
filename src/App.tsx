@@ -38,6 +38,9 @@ import {
   Trash2,
   Bookmark,
   Pin,
+  WifiOff,
+  Pause,
+  Check,
 } from 'lucide-react';
 import {
   auth,
@@ -70,6 +73,10 @@ import {
   isUsingStaticStore,
   saveTestsMetaToLocalStorageSafe,
   saveFoldersToLocalStorageSafe,
+  prefetchTestPaper,
+  fetchAllStudentsAndAttemptsForAdmin,
+  findStudentByEmailInFirestore,
+  isFirestoreQuotaCurrentlyExhausted,
 } from './firebase';
 import {
   CbtQuestion,
@@ -97,6 +104,16 @@ import {
 import { CbtExamRunner } from './components/CbtExamRunner';
 import { MyStudioAdmin } from './components/MyStudioAdmin';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { useOnlineStatus } from './hooks/useOnlineStatus';
+import {
+  downloadSingleTestOffline,
+  downloadTestsBatchOffline,
+  enqueueOfflineAttempt,
+  flushOfflineAttemptQueue,
+  getCachedOfflineTestIds,
+  getQueuedOfflineAttempts,
+  OfflineBatchProgress,
+} from './utils/offlineSyncManager';
 
 const NormalPdfViewerModal = React.lazy(() =>
   import('./components/NormalPdfViewerModal').then((m) => ({
@@ -740,6 +757,19 @@ function AppContent() {
   };
 
   // Student Auth State (Sign Up / Login / Forgot Password with Security Question)
+  const [adminStudentsSyncInfo, setAdminStudentsSyncInfo] = useState<{
+    syncing: boolean;
+    firestoreSynced: boolean;
+    quotaExhausted: boolean;
+    totalExpress: number;
+    totalFirestore: number;
+  }>({
+    syncing: false,
+    firestoreSynced: false,
+    quotaExhausted: isFirestoreQuotaCurrentlyExhausted(),
+    totalExpress: 0,
+    totalFirestore: 0,
+  });
   const [students, setStudents] = useState<StudentAccount[]>(() => {
     try {
       const saved = localStorage.getItem('vs_neet_2027_students_cache_v1');
@@ -854,6 +884,22 @@ function AppContent() {
     }
   });
   const [showNotificationsModal, setShowNotificationsModal] = useState(false);
+  const [showTelegramWelcomeModal, setShowTelegramWelcomeModal] = useState(true);
+  const isOnline = useOnlineStatus();
+  const [offlineCachedIds, setOfflineCachedIds] = useState<Set<string>>(() => new Set());
+  const [offlineBatchProgress, setOfflineBatchProgress] = useState<OfflineBatchProgress>({
+    active: false,
+    done: 0,
+    total: 0,
+    cachedCount: 0,
+    currentTitle: '',
+  });
+  const [downloadingSingleTestId, setDownloadingSingleTestId] = useState<string | null>(null);
+  const [pendingOfflineSyncCount, setPendingOfflineSyncCount] = useState<number>(() =>
+    getQueuedOfflineAttempts().length
+  );
+  const offlineAbortRef = useRef<AbortController | null>(null);
+  const autoOfflineStartedRef = useRef<boolean>(false);
   const [liveIncomingNotif, setLiveIncomingNotif] = useState<PortalNotification | null>(null);
   const [lastSeenNotifTime, setLastSeenNotifTime] = useState<number>(() => {
     try {
@@ -1235,8 +1281,8 @@ function AppContent() {
   // Listen to Firebase Auth for Google Sign-In students & push login data to Admin Store
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (fbUser) => {
-      if (fbUser && !currentStudent) {
-        const cleanEmail = String(fbUser.email || fbUser.uid || '').toLowerCase();
+      if (fbUser && !fbUser.isAnonymous && fbUser.email && !currentStudent) {
+        const cleanEmail = String(fbUser.email || '').trim().toLowerCase();
         const existing = students.find(
           (s) => String(s?.emailOrRoll || '').toLowerCase() === cleanEmail
         );
@@ -1261,6 +1307,14 @@ function AppContent() {
           lastLoginAt: Date.now(),
         };
         setCurrentStudent(googleStudent);
+        setStudents((prev) => [
+          googleStudent,
+          ...prev.filter(
+            (s) =>
+              s.id !== googleStudent.id &&
+              String(s.emailOrRoll || '').trim().toLowerCase() !== cleanEmail
+          ),
+        ]);
         safeLocalStorageSet('neet_cbt_student_session', JSON.stringify(googleStudent));
         saveStudentToFirestore(googleStudent, !existing).catch(() => {});
       }
@@ -1279,6 +1333,9 @@ function AppContent() {
 
   const currentStudentRef = useRef<StudentAccount | null>(null);
   currentStudentRef.current = currentStudent;
+
+  const isAdminUnlockedRef = useRef<boolean>(false);
+  isAdminUnlockedRef.current = isAdminUnlocked;
 
   const lastBootstrapSigRef = useRef<string>('');
   const hasReconciledVaultRef = useRef<boolean>(false);
@@ -1551,8 +1608,19 @@ function AppContent() {
         }
       }
 
+      const firstActiveFolderId =
+        boot.folders.find((f) => f && f.id && !deletedFolderSet.has(f.id))?.id || '';
+
       for (const t of sourceTests) {
-        if (!t || !t.id || !t.title || deletedSet.has(t.id)) continue;
+        if (
+          !t ||
+          !t.id ||
+          !t.title ||
+          deletedSet.has(t.id) ||
+          (t.folderId && deletedFolderSet.has(t.folderId))
+        ) {
+          continue;
+        }
         const prevEntry = map.get(t.id);
         const hasBannerProp = Object.prototype.hasOwnProperty.call(t, 'bannerUrl');
         const resolvedBanner = hasBannerProp
@@ -1565,7 +1633,8 @@ function AppContent() {
         const safeSubject = String(t.subject || 'Biology (जीव विज्ञान)');
         const safeChapter = String(t.chapter || 'Complete Syllabus');
         if (t.isPdfOnly) {
-          const pdfFolderId = t.folderId || 'folder_prayas';
+          const pdfFolderId =
+            t.folderId && !deletedFolderSet.has(t.folderId) ? t.folderId : firstActiveFolderId;
           const inheritedPdf = folderPdfLookup.get(pdfFolderId);
           map.set(t.id, {
             ...(prevEntry || {}),
@@ -1608,12 +1677,7 @@ function AppContent() {
                 ? 'Medium'
                 : 'Easy';
         const inferredFolderId =
-          t.folderId ||
-          (safeTitle.toLowerCase().includes('trackprep')
-            ? 'folder_trackprep'
-            : safeTitle.toLowerCase().includes('ubt')
-              ? 'folder_ubt_mock'
-              : 'folder_prayas');
+          t.folderId && !deletedFolderSet.has(t.folderId) ? t.folderId : firstActiveFolderId;
         const inheritedPdf = folderPdfLookup.get(inferredFolderId);
         map.set(t.id, {
           ...(prevEntry || {}),
@@ -1642,7 +1706,12 @@ function AppContent() {
         if (a.isPinned && b.isPinned && (b.pinnedAt || 0) !== (a.pinnedAt || 0)) {
           return (b.pinnedAt || 0) - (a.pinnedAt || 0);
         }
-        return (b.createdAt || 0) - (a.createdAt || 0);
+        const titleCmp = String(a.title || '').localeCompare(String(b.title || ''), undefined, {
+          numeric: true,
+          sensitivity: 'base',
+        });
+        if (titleCmp !== 0) return titleCmp;
+        return (a.createdAt || 0) - (b.createdAt || 0);
       });
       saveTestsMetaToLocalStorageSafe(finalTests);
       return finalTests;
@@ -1654,13 +1723,35 @@ function AppContent() {
     setStudents((prev) => {
       const map = new Map<string, StudentAccount>();
       for (const s of [...prev, ...boot.students]) {
-        if (s && s.id && !serverDeletedStudentSet.has(s.id)) {
-          map.set(s.id, s);
+        if (!s || !s.id || serverDeletedStudentSet.has(s.id)) continue;
+        const emailKey = String(s.emailOrRoll || '').trim().toLowerCase();
+        const key = emailKey ? `email:${emailKey}` : `id:${s.id}`;
+        const existing = map.get(key);
+        if (!existing) {
+          map.set(key, s);
+        } else {
+          const prevTs = Number(existing.lastOnlineAt || existing.lastLoginAt || existing.createdAt || 0);
+          const nextTs = Number(s.lastOnlineAt || s.lastLoginAt || s.createdAt || 0);
+          map.set(
+            key,
+            nextTs >= prevTs ? { ...existing, ...s, id: existing.id || s.id } : { ...s, ...existing }
+          );
         }
       }
-      const mergedStudents = Array.from(map.values());
+      const mergedStudents = Array.from(map.values()).sort(
+        (a, b) =>
+          Number(b.lastOnlineAt || b.lastLoginAt || b.createdAt || 0) -
+          Number(a.lastOnlineAt || a.lastLoginAt || a.createdAt || 0)
+      );
       try {
-        localStorage.setItem('vs_neet_2027_students_cache_v1', JSON.stringify(mergedStudents));
+        if (isAdminUnlockedRef.current) {
+          localStorage.setItem(
+            'vs_neet_2027_students_cache_v1',
+            JSON.stringify(mergedStudents.slice(0, 2000))
+          );
+        } else {
+          localStorage.removeItem('vs_neet_2027_students_cache_v1');
+        }
       } catch {
         // ignore
       }
@@ -1696,7 +1787,21 @@ function AppContent() {
         (a, b) => (b.completedAt || 0) - (a.completedAt || 0)
       );
       try {
-        localStorage.setItem('vs_neet_2027_attempts_cache', JSON.stringify(merged.slice(0, 80)));
+        if (isAdminUnlockedRef.current) {
+          localStorage.setItem('vs_neet_2027_attempts_cache', JSON.stringify(merged.slice(0, 200)));
+        } else if (currentStudentRef.current) {
+          const me = currentStudentRef.current;
+          const meEmail = String(me.emailOrRoll || '').trim().toLowerCase();
+          const meId = String(me.id || '').trim();
+          const ownOnly = merged.filter((a) => {
+            const aId = String(a.studentId || '').trim();
+            const aMail = String(a.studentEmail || '').trim().toLowerCase();
+            return (meId && aId === meId) || (meEmail && aMail === meEmail);
+          });
+          localStorage.setItem('vs_neet_2027_attempts_cache', JSON.stringify(ownOnly.slice(0, 80)));
+        } else {
+          localStorage.removeItem('vs_neet_2027_attempts_cache');
+        }
       } catch {
         // ignore
       }
@@ -1877,12 +1982,248 @@ function AppContent() {
     }
   }, [students]);
 
-  // Lookup matched student when email is typed in Forgot Password mode so we can display their chosen Security Question
+  // Lookup matched student ONLY for Security Question display in Forgot Password mode (never expose name/batch/attempts pre-login)
   const matchedStudentForForgot = useMemo(() => {
+    if (authModalMode !== 'forgot') return undefined;
     const cleanEmail = sanitizeInput(authEmailOrRoll, 120).toLowerCase();
     if (!cleanEmail) return undefined;
     return students.find((s) => String(s?.emailOrRoll || '').toLowerCase() === cleanEmail);
-  }, [authEmailOrRoll, students]);
+  }, [authEmailOrRoll, authModalMode, students]);
+
+  // Pre-warm browser cache for the top 3 tests inside whichever folder the student opens so clicking a test is instant (0ms)
+  useEffect(() => {
+    if (homeViewStep !== 'folder_tests' || !selectedFolderFilter || selectedFolderFilter === 'ALL') return;
+    if (!isOnline) return;
+    const folderTests = tests
+      .filter((t) => t && !t.isPdfOnly && t.folderId === selectedFolderFilter)
+      .slice(0, 3);
+    const timer = window.setTimeout(() => {
+      for (const ft of folderTests) {
+        prefetchTestPaper(ft.id, (ft as any).updatedAt || ft.createdAt || 1);
+      }
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [homeViewStep, selectedFolderFilter, tests, isOnline]);
+
+  // Refresh which tests are currently saved offline (Cache Storage + IndexedDB Vault)
+  useEffect(() => {
+    let cancelled = false;
+    void getCachedOfflineTestIds(tests).then((ids) => {
+      if (!cancelled) setOfflineCachedIds(ids);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [tests, activeRunningTest]);
+
+  // Stop background offline caching while an exam is actively running so it never competes for bandwidth/CPU
+  useEffect(() => {
+    if (activeRunningTest && offlineAbortRef.current) {
+      offlineAbortRef.current.abort();
+      offlineAbortRef.current = null;
+      setOfflineBatchProgress((prev) => ({ ...prev, active: false, currentTitle: '' }));
+    }
+  }, [activeRunningTest]);
+
+  // Polite automatic background caching of all tests when online so offline mode works seamlessly without extra steps
+  useEffect(() => {
+    if (!isOnline || tests.length === 0 || activeRunningTest || autoOfflineStartedRef.current) return;
+    const navConn = (navigator as unknown as { connection?: { saveData?: boolean } }).connection;
+    if (navConn?.saveData) return;
+
+    const timer = window.setTimeout(() => {
+      if (autoOfflineStartedRef.current || activeRunningTest || !navigator.onLine) return;
+      autoOfflineStartedRef.current = true;
+      const controller = new AbortController();
+      offlineAbortRef.current = controller;
+      void downloadTestsBatchOffline(tests, {
+        signal: controller.signal,
+        delayMsBetweenTests: 450,
+        onProgress: (prog, updatedIds) => {
+          setOfflineCachedIds(updatedIds);
+          setOfflineBatchProgress(prog);
+        },
+      }).finally(() => {
+        if (offlineAbortRef.current === controller) {
+          offlineAbortRef.current = null;
+        }
+      });
+    }, 3500);
+
+    return () => window.clearTimeout(timer);
+  }, [isOnline, tests, activeRunningTest]);
+
+  // Manual 1-tap Offline Download (for all tests or a specific folder)
+  const handleDownloadTestsOffline = useCallback(
+    async (targetList?: CbtTestMeta[], label?: string) => {
+      if (!navigator.onLine) {
+        showToast('Internet off hai — online aane par sabhi tests save kar sakte hain.', 'error');
+        return;
+      }
+      const list = (targetList && targetList.length > 0 ? targetList : tests).filter(Boolean);
+      if (list.length === 0) return;
+
+      if (offlineAbortRef.current) {
+        offlineAbortRef.current.abort();
+      }
+      const controller = new AbortController();
+      offlineAbortRef.current = controller;
+      autoOfflineStartedRef.current = true;
+
+      showToast(
+        `⬇️ Saving ${label || `${list.length} tests`} for Offline Mode...`,
+        'info'
+      );
+
+      const result = await downloadTestsBatchOffline(list, {
+        signal: controller.signal,
+        delayMsBetweenTests: 80,
+        alreadyCachedIds: offlineCachedIds,
+        onProgress: (prog, updatedIds) => {
+          setOfflineCachedIds(updatedIds);
+          setOfflineBatchProgress(prog);
+        },
+      });
+
+      if (offlineAbortRef.current === controller) {
+        offlineAbortRef.current = null;
+      }
+
+      if (!controller.signal.aborted) {
+        showToast(
+          `✅ Offline Mode Ready! ${result.totalCached} tests device par save hain — ab bina internet ke chalenge.`,
+          'success'
+        );
+      }
+    },
+    [tests, offlineCachedIds]
+  );
+
+  const handlePauseOfflineDownload = useCallback(() => {
+    if (offlineAbortRef.current) {
+      offlineAbortRef.current.abort();
+      offlineAbortRef.current = null;
+    }
+    setOfflineBatchProgress((prev) => ({ ...prev, active: false, currentTitle: '' }));
+    showToast('Offline download paused. Jo tests save ho gaye wo offline chalenge.', 'info');
+  }, []);
+
+  const handleDownloadSingleTestOffline = useCallback(
+    async (test: CbtTestMeta) => {
+      if (!navigator.onLine) {
+        showToast('Is test ko save karne ke liye pehle internet on karein.', 'error');
+        return;
+      }
+      if (downloadingSingleTestId === test.id) return;
+      setDownloadingSingleTestId(test.id);
+      try {
+        const res = await downloadSingleTestOffline(test);
+        if (res.cached) {
+          setOfflineCachedIds((prev) => {
+            const next = new Set(prev);
+            next.add(test.id);
+            return next;
+          });
+          showToast(`✅ "${test.title}" Offline Mode ke liye save ho gaya!`, 'success');
+        } else {
+          showToast('Is test ka paper abhi offline cache ke liye available nahi hai.', 'error');
+        }
+      } finally {
+        setDownloadingSingleTestId(null);
+      }
+    },
+    [downloadingSingleTestId]
+  );
+
+  // Automatically sync any test results submitted while offline as soon as internet returns
+  useEffect(() => {
+    if (!isOnline) return;
+    const queued = getQueuedOfflineAttempts();
+    setPendingOfflineSyncCount(queued.length);
+    if (queued.length === 0) return;
+
+    void flushOfflineAttemptQueue(async (att, prevHigh) => {
+      await recordTestCompletion(att, prevHigh);
+    }).then(({ synced, remaining }) => {
+      setPendingOfflineSyncCount(remaining);
+      if (synced > 0) {
+        showToast(
+          `✅ ${synced} offline test result${synced > 1 ? 's' : ''} server par auto-sync ho gaye!`,
+          'success'
+        );
+        void syncPortalStore('force_refresh');
+      }
+    });
+  }, [isOnline]);
+
+  // Admin-only full student & attempt sync (Express uncapped + Cloud Firestore with Express mirroring)
+  const syncAdminStudentsFromAllSources = useCallback(async (forceRetryFirestore = false) => {
+    setAdminStudentsSyncInfo((prev) => ({ ...prev, syncing: true }));
+    try {
+      const result = await fetchAllStudentsAndAttemptsForAdmin(forceRetryFirestore);
+      const deletedStudentSet = new Set(result.deletedStudentIds || []);
+      const deletedAttemptSet = new Set(result.deletedAttemptIds || []);
+
+      setStudents((prev) => {
+        const byKey = new Map<string, StudentAccount>();
+        for (const s of [...prev, ...result.students]) {
+          if (!s || !s.id || deletedStudentSet.has(s.id)) continue;
+          const emailKey = String(s.emailOrRoll || '').trim().toLowerCase();
+          const key = emailKey ? `email:${emailKey}` : `id:${s.id}`;
+          const existing = byKey.get(key);
+          if (!existing) {
+            byKey.set(key, s);
+          } else {
+            const prevTs = Number(existing.lastOnlineAt || existing.lastLoginAt || existing.createdAt || 0);
+            const nextTs = Number(s.lastOnlineAt || s.lastLoginAt || s.createdAt || 0);
+            byKey.set(
+              key,
+              nextTs >= prevTs ? { ...existing, ...s, id: existing.id || s.id } : { ...s, ...existing }
+            );
+          }
+        }
+        const merged = Array.from(byKey.values()).sort(
+          (a, b) =>
+            Number(b.lastOnlineAt || b.lastLoginAt || b.createdAt || 0) -
+            Number(a.lastOnlineAt || a.lastLoginAt || a.createdAt || 0)
+        );
+        try {
+          localStorage.setItem('vs_neet_2027_students_cache_v1', JSON.stringify(merged.slice(0, 2000)));
+        } catch {
+          // ignore
+        }
+        return merged;
+      });
+
+      setAttempts((prev) => {
+        const byId = new Map<string, TestAttempt>();
+        for (const a of [...prev, ...result.attempts]) {
+          if (!a) continue;
+          const key = a.id || `${a.testId}_${a.completedAt}`;
+          if (deletedAttemptSet.has(key) || (a.id && deletedAttemptSet.has(a.id))) continue;
+          if (a.studentId && deletedStudentSet.has(a.studentId)) continue;
+          byId.set(key, a);
+        }
+        return Array.from(byId.values()).sort(
+          (a, b) => Number(b.completedAt || 0) - Number(a.completedAt || 0)
+        );
+      });
+
+      setAdminStudentsSyncInfo({
+        syncing: false,
+        firestoreSynced: result.firestoreSynced,
+        quotaExhausted: result.quotaExhausted,
+        totalExpress: result.totalExpress,
+        totalFirestore: result.totalFirestore,
+      });
+    } catch {
+      setAdminStudentsSyncInfo((prev) => ({
+        ...prev,
+        syncing: false,
+        quotaExhausted: isFirestoreQuotaCurrentlyExhausted(),
+      }));
+    }
+  }, []);
 
   // Handle Admin Credentials Verification with Anti-Brute-Force Protection
   const handleAdminUnlockSubmit = (e: React.FormEvent) => {
@@ -1904,6 +2245,7 @@ function AppContent() {
       setAdminPasswordInput('');
       setAdminPassError('');
       setAdminFailedAttempts(0);
+      void syncAdminStudentsFromAllSources(true);
       showToast(`Admin Studio unlocked! Welcome ${ADMIN_USERNAME}.`, 'success');
     } else {
       const nextFails = adminFailedAttempts + 1;
@@ -2079,7 +2421,7 @@ function AppContent() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  // Complete post-login transition: Ensure Light Mode on first login, ask for Phone Notification Permission, and open pending test
+  // Complete post-login transition: Ensure Light Mode on first login, ask for Phone Notification Permission, notify admin, and open pending test
   const completeStudentLogin = (student: StudentAccount, welcomeMsg: string) => {
     try {
       if (!localStorage.getItem('vs_test_first_login_light_done')) {
@@ -2087,6 +2429,13 @@ function AppContent() {
         localStorage.setItem('vs_test_theme_mode_v2', 'light');
         setIsDarkMode(false);
       }
+    } catch {
+      // ignore
+    }
+
+    try {
+      void vsEnablePushPermission();
+      vsNotifyLogin(student, authModalMode === 'signup' ? 'signup' : 'login');
     } catch {
       // ignore
     }
@@ -2102,13 +2451,20 @@ function AppContent() {
     // Update daily calendar streak for today's login
     incrementDailyStudyStreak('Daily Login');
 
+    // Immediately pull latest Firestore + server attempts when online so the student's full history restores right away
+    if (typeof navigator === 'undefined' || navigator.onLine) {
+      void syncPortalStore('force_refresh');
+    }
+
     if (pendingTestAfterLogin) {
       const target = pendingTestAfterLogin;
       setPendingTestAfterLogin(null);
       setTests((prev) =>
         prev.map((t) => (t.id === target.id ? { ...t, openCount: (t.openCount || 0) + 1 } : t))
       );
-      incrementTestEngagement(target.id, 'openCount').catch(() => {});
+      if (typeof navigator === 'undefined' || navigator.onLine) {
+        incrementTestEngagement(target.id, 'openCount').catch(() => {});
+      }
       void handleStartExamNow(target, 'html');
     }
   };
@@ -2158,9 +2514,16 @@ function AppContent() {
     setIsSubmittingAuth(true);
     try {
       const encodedPass = btoa(encodeURIComponent(cleanPass));
-      const matched = students.find(
+      let matched = students.find(
         (s) => String(s?.emailOrRoll || '').toLowerCase() === cleanEmail
       );
+      if (!matched && (typeof navigator === 'undefined' || navigator.onLine)) {
+        const cloudStudent = await findStudentByEmailInFirestore(cleanEmail);
+        if (cloudStudent) {
+          matched = cloudStudent;
+          setStudents((prev) => [cloudStudent, ...prev.filter((s) => s.id !== cloudStudent.id)]);
+        }
+      }
 
       if (authModalMode === 'forgot') {
         const cleanSecAns = sanitizeInput(authSecurityQuestionAnswer, 100).toLowerCase();
@@ -2172,10 +2535,21 @@ function AppContent() {
           return;
         }
 
-        if (
-          matched?.securityAnswer &&
-          String(matched.securityAnswer).trim().toLowerCase() !== cleanSecAns
-        ) {
+        if (!matched) {
+          setAuthError('इस Email ID से कोई अकाउंट नहीं मिला। कृपया नया अकाउंट बनाने के लिए Sign Up करें।');
+          setIsSubmittingAuth(false);
+          return;
+        }
+
+        if (!matched.securityAnswer) {
+          setAuthError(
+            'इस अकाउंट में सुरक्षा प्रश्न सेट नहीं है। कृपया पासवर्ड रीसेट के लिए Admin से संपर्क करें।'
+          );
+          setIsSubmittingAuth(false);
+          return;
+        }
+
+        if (String(matched.securityAnswer).trim().toLowerCase() !== cleanSecAns) {
           setAuthError(
             'सुरक्षा प्रश्न का उत्तर गलत है! (Incorrect Security Answer for this account. Please enter the exact answer you set during Sign Up.)'
           );
@@ -2183,43 +2557,19 @@ function AppContent() {
           return;
         }
 
-        // Forgot Password Flow: Reset password after verifying Security Question Answer
-        const resetRecord: StudentAccount = matched
-          ? {
-              ...matched,
-              passwordHash: encodedPass,
-              passwordPlain: cleanPass,
-              securityQuestion: matched.securityQuestion || authSecurityQuestion,
-              securityAnswer: matched.securityAnswer || cleanSecAns,
-              loginCount: (matched.loginCount || 1) + 1,
-              lastLoginAt: Date.now(),
-            }
-          : {
-              id: `stu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-              fullName: cleanEmail.split('@')[0],
-              emailOrRoll: cleanEmail,
-              phone: '',
-              passwordHash: encodedPass,
-              passwordPlain: cleanPass,
-              securityQuestion: authSecurityQuestion,
-              securityAnswer: cleanSecAns,
-              targetBatch: 'NEET 2027 · Vs Target Batch',
-              city: '',
-              loginCount: 1,
-              createdAt: Date.now(),
-              lastLoginAt: Date.now(),
-            };
+        // Forgot Password Flow: Reset password ONLY after verifying Security Question Answer
+        const resetRecord: StudentAccount = {
+          ...matched,
+          passwordHash: encodedPass,
+          passwordPlain: cleanPass,
+          securityQuestion: matched.securityQuestion || authSecurityQuestion,
+          securityAnswer: matched.securityAnswer,
+          loginCount: (matched.loginCount || 1) + 1,
+          lastLoginAt: Date.now(),
+        };
 
-        await saveStudentToFirestore(resetRecord, !matched);
-        setStudents((prev) => {
-          const next = [resetRecord, ...prev.filter((s) => s.id !== resetRecord.id)];
-          try {
-            localStorage.setItem('vs_neet_2027_students_cache_v1', JSON.stringify(next));
-          } catch {
-            // ignore
-          }
-          return next;
-        });
+        await saveStudentToFirestore(resetRecord, false);
+        setStudents((prev) => [resetRecord, ...prev.filter((s) => s.id !== resetRecord.id)]);
         completeStudentLogin(
           resetRecord,
           `Password reset successful! Welcome back, ${resetRecord.fullName}.`
@@ -2241,65 +2591,45 @@ function AppContent() {
         }
 
         if (matched) {
-          const updatedExisting: StudentAccount = {
-            ...matched,
-            fullName: cleanName || matched.fullName,
-            passwordHash: encodedPass,
-            passwordPlain: cleanPass,
-            securityQuestion: authSecurityQuestion,
-            securityAnswer: cleanSecAns,
-            loginCount: (matched.loginCount || 1) + 1,
-            lastLoginAt: Date.now(),
-          };
-          await saveStudentToFirestore(updatedExisting, false);
-          setStudents((prev) => {
-            const next = [updatedExisting, ...prev.filter((s) => s.id !== updatedExisting.id)];
-            try {
-              localStorage.setItem('vs_neet_2027_students_cache_v1', JSON.stringify(next));
-            } catch {
-              // ignore
-            }
-            return next;
-          });
-          completeStudentLogin(
-            updatedExisting,
-            `Welcome back to Vs Neet 2027, ${updatedExisting.fullName}! Your test history is restored.`
+          setAuthError(
+            'यह Email ID पहले से रजिस्टर्ड है! कृपया Log In टैब से अपना पासवर्ड डालकर लॉगिन करें (या Forgot Password इस्तेमाल करें)।'
           );
-        } else {
-          const newStudent: StudentAccount = {
-            id: `stu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-            fullName: cleanName,
-            emailOrRoll: cleanEmail,
-            phone: '',
-            passwordHash: encodedPass,
-            passwordPlain: cleanPass,
-            securityQuestion: authSecurityQuestion,
-            securityAnswer: cleanSecAns,
-            targetBatch: 'NEET 2027 · Vs Target Batch',
-            city: '',
-            loginCount: 1,
-            createdAt: Date.now(),
-            lastLoginAt: Date.now(),
-          };
-          await saveStudentToFirestore(newStudent, true);
-          setStudents((prev) => {
-            const next = [newStudent, ...prev.filter((s) => s.id !== newStudent.id)];
-            try {
-              localStorage.setItem('vs_neet_2027_students_cache_v1', JSON.stringify(next));
-            } catch {
-              // ignore
-            }
-            return next;
-          });
-          completeStudentLogin(
-            newStudent,
-            `Account created! Welcome to Vs Neet 2027, ${newStudent.fullName}!`
-          );
+          setIsSubmittingAuth(false);
+          return;
         }
+
+        const newStudent: StudentAccount = {
+          id: `stu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+          fullName: cleanName,
+          emailOrRoll: cleanEmail,
+          phone: '',
+          passwordHash: encodedPass,
+          passwordPlain: cleanPass,
+          securityQuestion: authSecurityQuestion,
+          securityAnswer: cleanSecAns,
+          targetBatch: 'NEET 2027 · Vs Target Batch',
+          city: '',
+          loginCount: 1,
+          createdAt: Date.now(),
+          lastLoginAt: Date.now(),
+        };
+        await saveStudentToFirestore(newStudent, true);
+        setStudents((prev) => [newStudent, ...prev.filter((s) => s.id !== newStudent.id)]);
+        completeStudentLogin(
+          newStudent,
+          `Account created! Welcome to Vs Neet 2027, ${newStudent.fullName}!`
+        );
       } else {
-        // Log In Mode (Email + Password only)
+        // Log In Mode (Strict Email + Password verification)
+        if (!matched) {
+          setAuthError(
+            'इस Email ID से कोई अकाउंट नहीं मिला। कृपया नया अकाउंट बनाने के लिए "Sign Up" पर क्लिक करें।'
+          );
+          setIsSubmittingAuth(false);
+          return;
+        }
+
         if (
-          matched &&
           matched.passwordHash &&
           matched.passwordHash !== 'google_oauth' &&
           matched.passwordHash !== encodedPass &&
@@ -2321,41 +2651,27 @@ function AppContent() {
           return;
         }
 
-        const studentRecord: StudentAccount = matched
-          ? {
-              ...matched,
-              passwordPlain: cleanPass,
-              loginCount: (matched.loginCount || 1) + 1,
-              lastLoginAt: Date.now(),
-            }
-          : {
-              id: `stu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-              fullName: cleanEmail.split('@')[0],
-              emailOrRoll: cleanEmail,
-              phone: '',
-              passwordHash: encodedPass,
-              passwordPlain: cleanPass,
-              targetBatch: 'NEET 2027 · Vs Target Batch',
-              city: '',
-              loginCount: 1,
-              createdAt: Date.now(),
-              lastLoginAt: Date.now(),
-            };
+        const studentRecord: StudentAccount = {
+          ...matched,
+          passwordHash:
+            matched.passwordHash && matched.passwordHash !== 'google_oauth'
+              ? matched.passwordHash
+              : encodedPass,
+          passwordPlain: cleanPass,
+          loginCount: (matched.loginCount || 1) + 1,
+          lastLoginAt: Date.now(),
+        };
 
         setAuthFailedAttempts(0);
-        await saveStudentToFirestore(studentRecord, !matched);
-        setStudents((prev) => {
-          const next = [studentRecord, ...prev.filter((s) => s.id !== studentRecord.id)];
-          try {
-            localStorage.setItem('vs_neet_2027_students_cache_v1', JSON.stringify(next));
-          } catch {
-            // ignore
-          }
-          return next;
-        });
+        if (typeof navigator === 'undefined' || navigator.onLine) {
+          await saveStudentToFirestore(studentRecord, false).catch(() => {});
+        }
+        setStudents((prev) => [studentRecord, ...prev.filter((s) => s.id !== studentRecord.id)]);
         completeStudentLogin(
           studentRecord,
-          `Welcome back, ${studentRecord.fullName}! Your test history is synced.`
+          typeof navigator !== 'undefined' && !navigator.onLine
+            ? `Welcome back, ${studentRecord.fullName}! (Offline Mode active)`
+            : `Welcome back, ${studentRecord.fullName}! Your test history is synced.`
         );
       }
 
@@ -2431,8 +2747,12 @@ function AppContent() {
         lastLoginAt: Date.now(),
       };
 
-      await saveStudentToFirestore(updatedStudent, true);
+      await saveStudentToFirestore(updatedStudent, false);
       setCurrentStudent(updatedStudent);
+      setStudents((prev) => [
+        updatedStudent,
+        ...prev.filter((s) => s.id !== updatedStudent.id),
+      ]);
       localStorage.setItem('neet_cbt_student_session', JSON.stringify(updatedStudent));
       setShowProfileModal(false);
       showToast('Profile & Photo updated successfully!', 'success');
@@ -2446,7 +2766,36 @@ function AppContent() {
   const handleStudentLogout = () => {
     setCurrentStudent(null);
     setShowProfileModal(false);
-    localStorage.removeItem('neet_cbt_student_session');
+    try {
+      setAuthEmailOrRoll('');
+      setAuthPassword('');
+      setAuthFullName('');
+      setAuthSecurityQuestionAnswer('');
+      setAuthSecurityQuestion(SECURITY_QUESTIONS_LIST[0]);
+      setAuthError('');
+      setAuthModalMode('login');
+      setShowGoogleQuickForm(false);
+      setGoogleQuickEmail('');
+      setGoogleQuickName('');
+      setShowStudentAuthModal(false);
+    } catch {
+      // ignore
+    }
+    try {
+      localStorage.removeItem('neet_cbt_student_session');
+      localStorage.removeItem('vs_neet_my_device_attempt_ids_v1');
+      localStorage.removeItem('vs_neet_2027_attempts_cache');
+      localStorage.removeItem('vs_neet_2027_students_cache_v1');
+      sessionStorage.removeItem('vs_neet_active_test_session_v1');
+    } catch {
+      // ignore
+    }
+    try {
+      setAttempts([]);
+      setShowGoogleQuickForm(false);
+    } catch {
+      // ignore
+    }
     signOutUser().catch(() => {});
     showToast('Logged out of Student account.', 'info');
   };
@@ -2593,13 +2942,22 @@ function AppContent() {
     test: CbtTestMeta,
     modeOverride?: 'html' | 'practice'
   ) => {
+    if (!currentStudent && !isAdminUnlocked) {
+      setPendingTestAfterLogin(test);
+      setAuthModalMode('login');
+      setAuthError('');
+      setShowStudentAuthModal(true);
+      showToast('कृपया टेस्ट खोलने के लिए अपनी Student Email ID से Login / Sign Up करें।', 'info');
+      return;
+    }
+
     if (test.scheduledAt && test.scheduledAt > Date.now() && !isAdminUnlocked) {
       showToast('⏰ This test is still scheduled and locked until its start time.', 'error');
       return;
     }
 
     const launchMode = modeOverride || selectedExamLaunchMode;
-    const preferHtml = launchMode !== 'practice';
+    const preferHtml = launchMode !== 'practice' || true;
 
     let qs = localQuestionsCache[test.id] || [];
     const hasPlayableCachedQs =
@@ -2618,7 +2976,7 @@ function AppContent() {
     // INSTANT 0ms LAUNCH PATH for all HTML tests — never block on 'Opening Test Paper...' modal!
     if (preferHtml) {
       const initialQs = qs.length > 0 ? qs : createCleanCompanionSlots(test);
-      setLocalRawHtmlCache({});
+      const cachedHtmlNow = (localRawHtmlCache[test.id] || '').trim();
       setLocalQuestionsCache({ ...BUILT_IN_COMPANION_QUESTIONS, [test.id]: initialQs });
       setTests((prev) =>
         prev.map((t) => (t.id === test.id ? { ...t, playCount: (t.playCount || 0) + 1 } : t))
@@ -2630,13 +2988,13 @@ function AppContent() {
         meta: test,
         questions: initialQs,
         practiceMode: false,
-        rawHtmlContent: '',
+        rawHtmlContent: cachedHtmlNow.length > 20 ? cachedHtmlNow : '',
         initialHtmlMode: true,
-        useServerHtmlStream: true,
+        useServerHtmlStream: cachedHtmlNow.length <= 20,
         reviewAttempt: null,
       });
 
-      // Hydrate compact answer keys, /qimg URLs, OR Firestore-backed rawHtml without blocking UI
+      // Hydrate compact answer keys & /qimg URLs in background without disrupting an active server HTML stream
       if (!hasPlayableCachedQs && test.id !== 'prayas_06') {
         void loadTestFastForLaunch(test.id)
           .then((fastLaunch) => {
@@ -2646,27 +3004,33 @@ function AppContent() {
                 [test.id]: fastLaunch.questions,
               }));
             }
-            if (fastLaunch.rawHtml && fastLaunch.rawHtml.trim().length > 20) {
+            const hasFreshRawHtml = Boolean(
+              fastLaunch.rawHtml && fastLaunch.rawHtml.trim().length > 20
+            );
+            if (hasFreshRawHtml) {
               setLocalRawHtmlCache((prev) => ({
                 ...prev,
                 [test.id]: fastLaunch.rawHtml,
               }));
             }
-            if (fastLaunch.questions.length > 0 || (fastLaunch.rawHtml && fastLaunch.rawHtml.trim().length > 20)) {
-              setActiveRunningTest((prev) =>
-                prev && prev.meta.id === test.id
-                  ? {
-                      ...prev,
-                      questions:
-                        fastLaunch.questions.length > 0 ? fastLaunch.questions : prev.questions,
-                      rawHtmlContent:
-                        fastLaunch.rawHtml && fastLaunch.rawHtml.trim().length > 20
-                          ? fastLaunch.rawHtml
-                          : prev.rawHtmlContent,
-                      useServerHtmlStream: fastLaunch.useServerHtmlStream,
-                    }
-                  : prev
-              );
+            if (fastLaunch.questions.length > 0 || hasFreshRawHtml) {
+              setActiveRunningTest((prev) => {
+                if (!prev || prev.meta.id !== test.id) return prev;
+                // Keep live server/CDN iframe stream untouched once streaming to avoid mid-load resets or stale HTML swaps
+                if (prev.useServerHtmlStream) {
+                  return {
+                    ...prev,
+                    questions:
+                      fastLaunch.questions.length > 0 ? fastLaunch.questions : prev.questions,
+                  };
+                }
+                return {
+                  ...prev,
+                  questions:
+                    fastLaunch.questions.length > 0 ? fastLaunch.questions : prev.questions,
+                  rawHtmlContent: hasFreshRawHtml ? fastLaunch.rawHtml : prev.rawHtmlContent,
+                };
+              });
             }
           })
           .catch(() => {});
@@ -2762,28 +3126,12 @@ function AppContent() {
     }
 
     if (!currentStudent && !isAdminUnlocked) {
-      const autoStudent: StudentAccount =
-        students.length > 0 && students[0]?.id
-          ? students[0]
-          : {
-              id: 'stu_aspirant_default',
-              fullName: 'NEET Aspirant',
-              emailOrRoll: 'aspirant@vstests.in',
-              phone: '',
-              passwordHash: 'aspirant',
-              passwordPlain: 'aspirant',
-              targetBatch: 'NEET 2027 · Vs Target Batch',
-              city: '',
-              loginCount: 1,
-              createdAt: Date.now(),
-              lastLoginAt: Date.now(),
-            };
-      setCurrentStudent(autoStudent);
-      try {
-        localStorage.setItem('neet_cbt_student_session', JSON.stringify(autoStudent));
-      } catch {
-        // ignore
-      }
+      setPendingTestAfterLogin(test);
+      setAuthModalMode('login');
+      setAuthError('');
+      setShowStudentAuthModal(true);
+      showToast('कृपया टेस्ट खोलने के लिए अपनी Student Email ID से Login / Sign Up करें।', 'info');
+      return;
     }
 
     setTests((prev) =>
@@ -2972,17 +3320,26 @@ function AppContent() {
     } catch {
       // ignore
     }
+    const testsInsideFolder = tests.filter((t) => t && t.folderId === folderId);
+    for (const tf of testsInsideFolder) {
+      markTestDeletedLocally(tf.id);
+    }
     setFolders((prev) => {
       const next = prev.filter((f) => f.id !== folderId);
-      try {
-        localStorage.setItem('vs_neet_2027_folders_cache_v1', JSON.stringify(next));
-      } catch {
-        // ignore
-      }
+      saveFoldersToLocalStorageSafe(next);
+      return next;
+    });
+    setTests((prev) => {
+      const next = prev.filter((t) => t.folderId !== folderId);
+      saveTestsMetaToLocalStorageSafe(next);
       return next;
     });
     await deleteFolderFromFirestore(folderId);
+    await Promise.all(
+      testsInsideFolder.map((tf) => deleteTestFromFirestore(tf.id).catch(() => {}))
+    );
     await syncPortalStore('force_refresh');
+    showToast('Folder and its tests permanently deleted across all devices.', 'info');
   };
 
   const handleAdminSendNotification = async (
@@ -3058,35 +3415,20 @@ function AppContent() {
     showToast('Student record deleted.', 'info');
   };
 
-  // Student's personal attempts & stats — ONLY shows tests given by this student/device, deduplicated so 1 completed test = 1 card
+  // Student's personal attempts & stats — STRICTLY isolated to the logged-in student's own ID/Email (Admin sees all in Studio)
   const studentPersonalAttempts = useMemo(() => {
-    let deviceAttemptIds = new Set<string>();
-    try {
-      const rawDev = localStorage.getItem('vs_neet_my_device_attempt_ids_v1');
-      if (rawDev) {
-        const parsed = JSON.parse(rawDev);
-        if (Array.isArray(parsed)) deviceAttemptIds = new Set(parsed.map(String));
-      }
-    } catch {
-      // ignore
-    }
+    if (!currentStudent) return [];
 
-    const emailLower = currentStudent
-      ? String(currentStudent.emailOrRoll || '').trim().toLowerCase()
-      : '';
-    const stuId = currentStudent ? String(currentStudent.id || '').trim() : '';
+    const emailLower = String(currentStudent.emailOrRoll || '').trim().toLowerCase();
+    const stuId = String(currentStudent.id || '').trim();
 
     const matched = attempts.filter((a) => {
       if (!a || !a.testId) return false;
-      if (currentStudent) {
-        const aEmail = String(a.studentEmail || '').trim().toLowerCase();
-        const aStuId = String(a.studentId || '').trim();
-        if (stuId && aStuId === stuId) return true;
-        if (emailLower && aEmail === emailLower) return true;
-        if (a.id && deviceAttemptIds.has(a.id) && (!aEmail || aEmail === emailLower)) return true;
-        return false;
-      }
-      return Boolean(a.id && (deviceAttemptIds.has(a.id) || String(a.id).startsWith('local_')));
+      const aEmail = String(a.studentEmail || '').trim().toLowerCase();
+      const aStuId = String(a.studentId || '').trim();
+      if (stuId && aStuId && aStuId === stuId) return true;
+      if (emailLower && aEmail && aEmail === emailLower) return true;
+      return false;
     });
 
     // Deduplicate by testId so each test attempted shows once (with its latest attempt)
@@ -3335,8 +3677,23 @@ function AppContent() {
     // Increment Daily Study Streak when a student completes a test
     incrementDailyStudyStreak('Test Completed');
 
-    await recordTestCompletion(enrichedAttempt, prevHigh);
-    await syncPortalStore('force_refresh');
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      const qCount = enqueueOfflineAttempt(enrichedAttempt, prevHigh);
+      setPendingOfflineSyncCount(qCount);
+      showToast(
+        '✅ Test result offline save ho gaya! Internet aate hi automatically sync ho jayega.',
+        'success'
+      );
+      return;
+    }
+
+    try {
+      await recordTestCompletion(enrichedAttempt, prevHigh);
+      await syncPortalStore('force_refresh');
+    } catch {
+      const qCount = enqueueOfflineAttempt(enrichedAttempt, prevHigh);
+      setPendingOfflineSyncCount(qCount);
+    }
   };
 
   // Allow students to delete a completed test attempt from their Homepage Completed Tests section
@@ -3408,7 +3765,12 @@ function AppContent() {
         if (a.isPinned && b.isPinned && (b.pinnedAt || 0) !== (a.pinnedAt || 0)) {
           return (b.pinnedAt || 0) - (a.pinnedAt || 0);
         }
-        return (b.createdAt || 0) - (a.createdAt || 0);
+        const titleCmp = String(a.title || '').localeCompare(String(b.title || ''), undefined, {
+          numeric: true,
+          sensitivity: 'base',
+        });
+        if (titleCmp !== 0) return titleCmp;
+        return (a.createdAt || 0) - (b.createdAt || 0);
       });
   }, [tests, folders, selectedFolderFilter, subjectFilter, searchQuery]);
 
@@ -3985,8 +4347,37 @@ function AppContent() {
                 <ChevronRight className="w-4 h-4 opacity-60" />
               </button>
 
+              <button
+                type="button"
+                onClick={() => {
+                  setShowQuickMenu(false);
+                  if (offlineBatchProgress.active) {
+                    handlePauseOfflineDownload();
+                  } else {
+                    void handleDownloadTestsOffline(tests, 'all tests');
+                  }
+                }}
+                className="liquid-glass-item w-full flex items-center justify-between gap-2 px-4 py-3 rounded-2xl text-xs sm:text-sm font-extrabold text-black dark:text-white"
+              >
+                <span className="flex items-center gap-2.5">
+                  {offlineBatchProgress.active ? (
+                    <Loader2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 animate-spin shrink-0" />
+                  ) : (
+                    <Download className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                  )}
+                  <span>
+                    {offlineBatchProgress.active
+                      ? `Saving Offline (${offlineBatchProgress.done}/${offlineBatchProgress.total})`
+                      : 'Save All Tests Offline'}
+                  </span>
+                </span>
+                <span className="text-xs font-mono-tabular text-emerald-700 dark:text-emerald-300 font-bold">
+                  {offlineCachedIds.size}/{tests.length}
+                </span>
+              </button>
+
               <a
-                href="https://t.me/vstestneet"
+                href="https://t.me/neettest2027h"
                 target="_blank"
                 rel="noopener noreferrer"
                 onClick={() => setShowQuickMenu(false)}
@@ -4059,7 +4450,12 @@ function AppContent() {
             globalAttachmentPdf={globalAttachmentPdf}
             portalLogoUrl={portalLogoUrl}
             onUpdatePortalLogo={handleAdminUpdatePortalLogo}
-            onRefreshPortal={() => syncPortalStore('force_refresh')}
+            onRefreshPortal={() => {
+              void syncPortalStore('force_refresh');
+              void syncAdminStudentsFromAllSources(true);
+            }}
+            onSyncAllStudents={() => syncAdminStudentsFromAllSources(true)}
+            studentsSyncStatus={adminStudentsSyncInfo}
             onPreviewNormalPdf={(url, title) => setActiveNormalPdfModal({ url, title })}
             onSaveTest={handleAdminSaveTest}
             onDeleteTest={handleAdminDeleteTest}
@@ -4982,6 +5378,86 @@ function AppContent() {
                     <ChevronRight className="w-4 h-4" />
                   </button>
                 </div>
+
+                {/* Offline Mode Manager Card — 1-Tap Save All Tests for 100% Offline Access */}
+                <div className="sm:col-span-2 liquid-glass-card rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3.5">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div
+                      className={`w-11 h-11 rounded-2xl border flex items-center justify-center shrink-0 shadow-sm ${
+                        !isOnline
+                          ? 'bg-amber-500/20 border-amber-500/50 text-amber-600 dark:text-amber-300'
+                          : 'bg-emerald-500/15 dark:bg-emerald-950/90 border-emerald-500/40 text-emerald-600 dark:text-emerald-400'
+                      }`}
+                    >
+                      {!isOnline ? (
+                        <WifiOff className="w-5 h-5" />
+                      ) : offlineBatchProgress.active ? (
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                      ) : (
+                        <Download className="w-5 h-5" />
+                      )}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-[10px] font-extrabold uppercase tracking-wider text-emerald-700 dark:text-emerald-300">
+                          {!isOnline ? 'Offline Mode Active' : 'Offline Test Mode'}
+                        </span>
+                        <span className="text-xs font-mono-tabular font-black text-black dark:text-white">
+                          {offlineCachedIds.size} / {tests.length} Tests Ready
+                        </span>
+                      </div>
+                      <p className="text-xs font-semibold text-slate-700 dark:text-slate-300 truncate mt-0.5">
+                        {offlineBatchProgress.active
+                          ? `Downloading: ${offlineBatchProgress.currentTitle || 'Test paper'} (${offlineBatchProgress.done}/${offlineBatchProgress.total})`
+                          : !isOnline
+                            ? 'Bina internet ke saved sabhi tests abhi chala sakte hain.'
+                            : 'Ek baar save kar lein — phir bina internet ke sabhi tests 100% work karenge.'}
+                      </p>
+                      {offlineBatchProgress.active && offlineBatchProgress.total > 0 && (
+                        <div className="mt-2 h-1.5 w-full max-w-md rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                          <div
+                            className="h-full bg-emerald-500 transition-all duration-300"
+                            style={{
+                              width: `${Math.min(
+                                100,
+                                Math.round(
+                                  (offlineBatchProgress.done / Math.max(1, offlineBatchProgress.total)) * 100
+                                )
+                              )}%`,
+                            }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    {offlineBatchProgress.active ? (
+                      <button
+                        type="button"
+                        onClick={handlePauseOfflineDownload}
+                        className="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-xs inline-flex items-center gap-1.5 shadow-sm cursor-pointer"
+                      >
+                        <Pause className="w-3.5 h-3.5" />
+                        <span>Pause</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={!isOnline}
+                        onClick={() => void handleDownloadTestsOffline(tests, 'all tests')}
+                        className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-extrabold text-xs inline-flex items-center gap-1.5 shadow-sm cursor-pointer"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>
+                          {offlineCachedIds.size >= tests.length && tests.length > 0
+                            ? 'All Saved Offline ✓'
+                            : 'Save All Offline'}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
             ) : homeViewStep === 'folders' ? (
               /* STEP 2: ALL TEST FOLDERS VIEW IN LIQUID GLASS EFFECT ("Jab kisi bhi folder ko open kre to wah liquid glass eefect me open ho") */
@@ -5116,19 +5592,54 @@ function AppContent() {
                     </div>
                   </div>
 
-                  {/* Search Input inside Folder */}
-                  <div className="relative w-full sm:w-64">
-                    <Search className="w-4 h-4 text-sky-600 dark:text-sky-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      value={searchQuery}
-                      onChange={(e) => {
-                        const val = sanitizeInput(e.target.value, 100);
-                        setSearchQuery(val);
-                      }}
-                      placeholder="Search test or chapter..."
-                      className="w-full min-h-[40px] pl-9 pr-4 py-2 rounded-xl liquid-glass-item text-xs sm:text-sm font-bold text-black dark:text-white placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-500"
-                    />
+                  {/* Folder Offline Download + Search Input */}
+                  <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto">
+                    {offlineBatchProgress.active ? (
+                      <button
+                        type="button"
+                        onClick={handlePauseOfflineDownload}
+                        className="min-h-[40px] px-3 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-extrabold inline-flex items-center gap-1.5 shadow-sm cursor-pointer"
+                      >
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>
+                          Saving {offlineBatchProgress.done}/{offlineBatchProgress.total} · Pause
+                        </span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={!isOnline}
+                        onClick={() =>
+                          void handleDownloadTestsOffline(
+                            filteredTests,
+                            selectedFolderFilter === 'ALL' ? 'all tests' : 'this folder'
+                          )
+                        }
+                        className="min-h-[40px] px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-extrabold inline-flex items-center gap-1.5 shadow-sm cursor-pointer"
+                        title="Save all tests in this folder for Offline Mode"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>
+                          Save Offline (
+                          {filteredTests.filter((t) => offlineCachedIds.has(t.id)).length}/
+                          {filteredTests.length})
+                        </span>
+                      </button>
+                    )}
+
+                    <div className="relative flex-1 sm:w-60">
+                      <Search className="w-4 h-4 text-sky-600 dark:text-sky-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => {
+                          const val = sanitizeInput(e.target.value, 100);
+                          setSearchQuery(val);
+                        }}
+                        placeholder="Search test or chapter..."
+                        className="w-full min-h-[40px] pl-9 pr-4 py-2 rounded-xl liquid-glass-item text-xs sm:text-sm font-bold text-black dark:text-white placeholder:text-slate-500 dark:placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                      />
+                    </div>
                   </div>
                 </div>
 
@@ -5341,6 +5852,34 @@ function AppContent() {
                                   <span>{isTestTicked ? '☑️ Done ✔' : '⬜ Tick'}</span>
                                 </button>
 
+                                {offlineCachedIds.has(test.id) ? (
+                                  <span
+                                    className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded-lg bg-emerald-500/15 dark:bg-emerald-950/90 border border-emerald-500/40 text-emerald-800 dark:text-emerald-300 text-[10px] font-extrabold"
+                                    title="Saved on device — works 100% Offline"
+                                  >
+                                    <Check className="w-3 h-3 shrink-0" />
+                                    <span>Offline</span>
+                                  </span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={!isOnline || downloadingSingleTestId === test.id}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void handleDownloadSingleTestOffline(test);
+                                    }}
+                                    className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded-lg ice-glass border border-sky-300/70 dark:border-slate-700 text-sky-800 dark:text-sky-300 text-[10px] font-extrabold disabled:opacity-50 cursor-pointer"
+                                    title="Save this test for Offline Mode"
+                                  >
+                                    {downloadingSingleTestId === test.id ? (
+                                      <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                                    ) : (
+                                      <Download className="w-3 h-3 shrink-0" />
+                                    )}
+                                    <span>Save</span>
+                                  </button>
+                                )}
+
                                 {completedAttempt && !test.isPdfOnly ? (
                                   <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-emerald-500/15 dark:bg-emerald-950/90 border border-emerald-500/40 dark:border-emerald-700 text-emerald-900 dark:text-emerald-300 text-xs font-extrabold">
                                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
@@ -5496,7 +6035,7 @@ function AppContent() {
                               </button>
                             )}
 
-                            {!test.isPdfOnly && (
+                            {!test.isPdfOnly && !String(test.id || '').startsWith('pyq_') && (
                               <button
                                 type="button"
                                 onClick={(e) => {
@@ -5891,7 +6430,7 @@ function AppContent() {
                   className="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 text-sm font-semibold text-black dark:text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500"
                 />
                 <p className="text-[11px] text-slate-600 dark:text-slate-400 mt-1">
-                  Jis email se login karenge uska purana test data aur score apne aap aa jayega.
+                  Apne Email aur Password se login karne par sirf aapka hi profile aur test history dikhega.
                 </p>
               </div>
 
@@ -5971,6 +6510,11 @@ function AppContent() {
                   className="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 text-sm font-semibold text-black dark:text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500"
                 />
               </div>
+
+              <p className="text-[10px] leading-relaxed text-slate-500 dark:text-slate-400 px-0.5">
+                Login activity (name, email, device and time) is recorded for account security and
+                shared with the institute administrator.
+              </p>
 
               {(authModalMode !== 'login' || authFailedAttempts >= 2) && (
                 <div className="p-3 rounded-xl bg-slate-100 dark:bg-slate-950 border border-slate-300 dark:border-slate-800 flex items-center justify-between gap-3">
@@ -6076,36 +6620,60 @@ function AppContent() {
                         dailyStreak: existing?.dailyStreak || studyStreak,
                       };
                       await saveStudentToFirestore(googleStudent, !existing);
+                      setStudents((prev) => [
+                        googleStudent,
+                        ...prev.filter(
+                          (s) =>
+                            s.id !== googleStudent.id &&
+                            String(s.emailOrRoll || '').trim().toLowerCase() !== cleanEmail
+                        ),
+                      ]);
                       completeStudentLogin(googleStudent, 'Signed in with Google!');
                     })
                     .catch(() => {
-                      // Seamless fallback when preview iframe or mobile browser blocks third-party popup
+                      // Safe fallback when preview iframe or mobile browser blocks third-party Google popup
                       const typedEmail = sanitizeInput(authEmailOrRoll, 120).toLowerCase();
                       if (typedEmail && typedEmail.includes('@')) {
                         const existing = students.find(
                           (s) => String(s?.emailOrRoll || '').toLowerCase() === typedEmail
                         );
-                        const instantGoogleStudent: StudentAccount = {
-                          id: existing?.id || `stu_g_${Date.now().toString(36)}`,
-                          fullName:
-                            existing?.fullName ||
-                            sanitizeInput(authFullName, 100) ||
-                            typedEmail.split('@')[0],
-                          emailOrRoll: typedEmail,
-                          phone: existing?.phone || '',
-                          photoUrl: existing?.photoUrl,
-                          passwordHash: existing?.passwordHash || 'google_oauth',
-                          passwordPlain: existing?.passwordPlain || 'Google Sign-In',
-                          securityQuestion: existing?.securityQuestion,
-                          securityAnswer: existing?.securityAnswer,
-                          targetBatch: existing?.targetBatch || 'NEET 2027 · Vs Target Batch',
-                          city: existing?.city || '',
-                          loginCount: (existing?.loginCount || 0) + 1,
-                          createdAt: existing?.createdAt || Date.now(),
-                          lastLoginAt: Date.now(),
-                          dailyStreak: existing?.dailyStreak || studyStreak,
-                        };
+                        if (existing && existing.passwordHash && existing.passwordHash !== 'google_oauth') {
+                          setAuthError(
+                            'यह Email पहले से रजिस्टर्ड है। कृपया ऊपर Email और Password डालकर Log In करें।'
+                          );
+                          return;
+                        }
+                        const instantGoogleStudent: StudentAccount = existing
+                          ? {
+                              ...existing,
+                              loginCount: (existing.loginCount || 1) + 1,
+                              lastLoginAt: Date.now(),
+                            }
+                          : {
+                              id: `stu_g_${Date.now().toString(36)}`,
+                              fullName:
+                                sanitizeInput(authFullName, 100) ||
+                                typedEmail.split('@')[0],
+                              emailOrRoll: typedEmail,
+                              phone: '',
+                              passwordHash: 'google_oauth',
+                              passwordPlain: 'Google Sign-In',
+                              targetBatch: 'NEET 2027 · Vs Target Batch',
+                              city: '',
+                              loginCount: 1,
+                              createdAt: Date.now(),
+                              lastLoginAt: Date.now(),
+                              dailyStreak: studyStreak,
+                            };
                         void saveStudentToFirestore(instantGoogleStudent, !existing);
+                        setStudents((prev) => [
+                          instantGoogleStudent,
+                          ...prev.filter(
+                            (s) =>
+                              s.id !== instantGoogleStudent.id &&
+                              String(s.emailOrRoll || '').trim().toLowerCase() !== typedEmail
+                          ),
+                        ]);
                         completeStudentLogin(instantGoogleStudent, 'Signed in with Google!');
                         return;
                       }
@@ -6173,38 +6741,54 @@ function AppContent() {
                       }
                       const gName =
                         sanitizeInput(googleQuickName, 100) || gMail.split('@')[0] || 'NEET Student';
-                      const existing = students.find(
+                      let existing = students.find(
                         (s) => String(s?.emailOrRoll || '').toLowerCase() === gMail
                       );
-                      const googleStudent: StudentAccount = {
-                        id: existing?.id || `stu_g_${Date.now().toString(36)}`,
-                        fullName: gName,
-                        emailOrRoll: gMail,
-                        phone: existing?.phone || '',
-                        photoUrl: existing?.photoUrl,
-                        passwordHash: existing?.passwordHash || 'google_oauth',
-                        passwordPlain: existing?.passwordPlain || 'Google Sign-In',
-                        securityQuestion: existing?.securityQuestion,
-                        securityAnswer: existing?.securityAnswer,
-                        targetBatch: existing?.targetBatch || 'NEET 2027 · Vs Target Batch',
-                        city: existing?.city || '',
-                        loginCount: (existing?.loginCount || 0) + 1,
-                        createdAt: existing?.createdAt || Date.now(),
-                        lastLoginAt: Date.now(),
-                        dailyStreak: existing?.dailyStreak || studyStreak,
-                      };
+                      if (!existing) {
+                        const cloudMatch = await findStudentByEmailInFirestore(gMail);
+                        if (cloudMatch) existing = cloudMatch;
+                      }
+                      if (existing && existing.passwordHash && existing.passwordHash !== 'google_oauth') {
+                        setShowGoogleQuickForm(false);
+                        setAuthEmailOrRoll(gMail);
+                        setAuthModalMode('login');
+                        setAuthError(
+                          'यह Email पहले से रजिस्टर्ड है। कृपया सुरक्षा के लिए अपना Password डालकर Log In करें।'
+                        );
+                        return;
+                      }
+                      const googleStudent: StudentAccount = existing
+                        ? {
+                            ...existing,
+                            fullName: existing.fullName || gName,
+                            loginCount: (existing.loginCount || 1) + 1,
+                            lastLoginAt: Date.now(),
+                          }
+                        : {
+                            id: `stu_g_${Date.now().toString(36)}`,
+                            fullName: gName,
+                            emailOrRoll: gMail,
+                            phone: '',
+                            passwordHash: 'google_oauth',
+                            passwordPlain: 'Google Sign-In',
+                            targetBatch: 'NEET 2027 · Vs Target Batch',
+                            city: '',
+                            loginCount: 1,
+                            createdAt: Date.now(),
+                            lastLoginAt: Date.now(),
+                            dailyStreak: studyStreak,
+                          };
                       setShowGoogleQuickForm(false);
                       await saveStudentToFirestore(googleStudent, !existing);
-                      setStudents((prev) => {
-                        const next = [googleStudent, ...prev.filter((s) => s.id !== googleStudent.id)];
-                        try {
-                          localStorage.setItem('vs_neet_2027_students_cache_v1', JSON.stringify(next));
-                        } catch {
-                          // ignore
-                        }
-                        return next;
-                      });
-                      completeStudentLogin(googleStudent, `Signed in with Google (${gName})!`);
+                      setStudents((prev) => [
+                        googleStudent,
+                        ...prev.filter(
+                          (s) =>
+                            s.id !== googleStudent.id &&
+                            String(s.emailOrRoll || '').trim().toLowerCase() !== gMail
+                        ),
+                      ]);
+                      completeStudentLogin(googleStudent, `Signed in with Google (${googleStudent.fullName})!`);
                     }}
                     className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs sm:text-sm font-extrabold transition cursor-pointer"
                   >
@@ -6754,9 +7338,243 @@ function AppContent() {
           </React.Suspense>
         </PdfModalErrorBoundary>
       )}
+      {/* =====================================================================
+          MODAL 7: WELCOME TELEGRAM POPUP ("More Test for Telegram")
+         ===================================================================== */}
+      {showTelegramWelcomeModal && !activeRunningTest && (
+        <div
+          onClick={() => setShowTelegramWelcomeModal(false)}
+          className="fixed inset-0 z-[70] bg-black/65 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="max-w-sm w-full bg-white dark:bg-slate-900 border border-sky-200 dark:border-sky-800 rounded-3xl p-6 text-center space-y-4 shadow-2xl relative"
+          >
+            <button
+              type="button"
+              onClick={() => setShowTelegramWelcomeModal(false)}
+              aria-label="Close popup"
+              className="absolute top-3.5 right-3.5 p-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 transition cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+
+            <div className="mx-auto w-14 h-14 rounded-2xl bg-sky-500/15 border border-sky-500/35 flex items-center justify-center">
+              <svg
+                className="w-8 h-8 text-sky-500"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+                aria-hidden="true"
+              >
+                <path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z" />
+              </svg>
+            </div>
+
+            <div className="space-y-1.5">
+              <h3 className="text-xl font-black text-slate-900 dark:text-white tracking-tight">
+                More Test for Telegram
+              </h3>
+              <p className="text-xs sm:text-sm font-medium text-slate-600 dark:text-slate-300">
+                Join our official Telegram channel for more free NEET CBT tests, PDFs &amp; instant updates.
+              </p>
+            </div>
+
+            <div className="space-y-2.5 pt-1">
+              <a
+                href="https://t.me/vsneetcbt"
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => setShowTelegramWelcomeModal(false)}
+                className="w-full min-h-[46px] inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-sky-500 hover:bg-sky-600 text-white text-sm font-extrabold shadow-md transition"
+              >
+                <span>Join Telegram (@vsneetcbt)</span>
+                <ChevronRight className="w-4 h-4" />
+              </a>
+
+              <button
+                type="button"
+                onClick={() => setShowTelegramWelcomeModal(false)}
+                className="w-full py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-xs font-bold text-slate-700 dark:text-slate-300 transition cursor-pointer"
+              >
+                Continue to Website
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Offline Connectivity Indicator Banner */}
+      {!isOnline && (
+        <div className="fixed bottom-4 left-4 z-50 flex items-center gap-2 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-extrabold text-slate-950 shadow-xl border border-amber-300">
+          <WifiOff className="w-3.5 h-3.5 shrink-0" />
+          <span>
+            Offline Mode · {offlineCachedIds.size} tests ready
+            {pendingOfflineSyncCount > 0 ? ` · ${pendingOfflineSyncCount} result pending sync` : ''}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
+
+/* ===================== Vs Tests: hardening + notifications + login-notify ===================== */
+async function vsEnablePushPermission(): Promise<void> {
+  try {
+    if (typeof window === 'undefined' || !('Notification' in window)) return;
+    if (Notification.permission === 'denied' || Notification.permission === 'granted') return;
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') return;
+    try {
+      if ('serviceWorker' in navigator) {
+        const reg = await navigator.serviceWorker.ready;
+        if (reg && typeof reg.showNotification === 'function') {
+          await reg.showNotification('🔔 Notifications On', {
+            body: 'Ab aapko naye test, result aur update ki jankari turant milegi.',
+            icon: '/pwa-192x192.png',
+            badge: '/pwa-192x192.png',
+            tag: 'vs_perm_granted',
+          });
+          return;
+        }
+      }
+    } catch {
+      // ignore SW notification fallback
+    }
+    try {
+      new Notification('🔔 Notifications On', {
+        body: 'Ab aapko naye test, result aur update ki jankari turant milegi.',
+      });
+    } catch {
+      // ignore
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function vsNotifyLogin(student: StudentAccount | null | undefined, mode?: 'login' | 'signup'): void {
+  try {
+    if (!student || !student.id) return;
+    const isNew = mode === 'signup' || student.createdAt === student.lastLoginAt;
+    const body = {
+      name: String(student.fullName || 'NEET Student').slice(0, 80),
+      email: String(student.emailOrRoll || '').slice(0, 150),
+      phone: String(student.phone || '').slice(0, 20),
+      batch: String(student.targetBatch || '').slice(0, 80),
+      city: String(student.city || '').slice(0, 60),
+      loginCount: Number(student.loginCount) || 1,
+      mode: isNew ? 'signup' : 'login',
+      time: new Date().toISOString(),
+      device: String(navigator.userAgent || '').slice(0, 200),
+      screen: `${window.innerWidth}x${window.innerHeight}`,
+      lang: String(navigator.language || '').slice(0, 10),
+    };
+    fetch('/api/login-notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    // ignore
+  }
+}
+
+function vsLogErr(msg: unknown): void {
+  try {
+    const key = 'vs_error_log_v1';
+    let arr: Array<{ t: number; m: string }> = [];
+    try {
+      const parsed = JSON.parse(localStorage.getItem(key) || '[]');
+      if (Array.isArray(parsed)) arr = parsed;
+    } catch {
+      arr = [];
+    }
+    arr.push({ t: Date.now(), m: String(msg ?? 'error').slice(0, 300) });
+    if (arr.length > 20) arr = arr.slice(-20);
+    localStorage.setItem(key, JSON.stringify(arr));
+  } catch {
+    // ignore
+  }
+}
+
+function vsHarden(): void {
+  try {
+    if (typeof window === 'undefined') return;
+    const win = window as Window & { __vsHardened?: boolean };
+    if (win.__vsHardened) return;
+    win.__vsHardened = true;
+
+    [
+      'vs_neet_2027_attempts_cache',
+      'vs_neet_2027_students_cache_v1',
+      'neet_cbt_student_session',
+      'vs_admin_ticked_students_v1',
+      'vs_neet_deleted_test_ids_v1',
+    ].forEach((k) => {
+      try {
+        const v = localStorage.getItem(k);
+        if (!v) return;
+        JSON.parse(v);
+      } catch {
+        try {
+          localStorage.removeItem(k);
+        } catch {
+          // ignore
+        }
+      }
+    });
+
+    const setLazy = (img: Element) => {
+      try {
+        if (!(img instanceof HTMLImageElement)) return;
+        if (!img.hasAttribute('loading')) img.loading = 'lazy';
+        if (!img.hasAttribute('decoding')) img.decoding = 'async';
+      } catch {
+        // ignore
+      }
+    };
+    const scan = (root: ParentNode | null) => {
+      try {
+        root?.querySelectorAll?.('img').forEach(setLazy);
+      } catch {
+        // ignore
+      }
+    };
+    scan(document);
+
+    try {
+      new MutationObserver((muts) => {
+        for (const m of muts) {
+          m.addedNodes.forEach((n) => {
+            if (!n || n.nodeType !== 1) return;
+            const el = n as Element;
+            if (el.tagName === 'IMG') setLazy(el);
+            else if (el.querySelectorAll) scan(el);
+          });
+        }
+      }).observe(document.documentElement, { childList: true, subtree: true });
+    } catch {
+      // ignore
+    }
+
+    try {
+      window.addEventListener('error', (ev) => vsLogErr(ev?.message || 'error'), { passive: true });
+      window.addEventListener(
+        'unhandledrejection',
+        (ev) => vsLogErr(`promise: ${(ev?.reason as Error)?.message || ev?.reason || 'rejection'}`),
+        { passive: true }
+      );
+    } catch {
+      // ignore
+    }
+  } catch {
+    // ignore
+  }
+}
+
+vsHarden();
+
 
 export default function App() {
   return (

@@ -36,6 +36,7 @@ import {
   Image as ImageIcon,
   Pin,
   ArrowLeft,
+  RefreshCw,
 } from 'lucide-react';
 import {
   CbtQuestion,
@@ -417,6 +418,14 @@ interface MyStudioAdminProps {
   onLoadQuestionsForTest: (test: CbtTestMeta) => Promise<CbtQuestion[]>;
   onBackToStudentPortal?: () => void;
   onLockStudio: () => void;
+  onSyncAllStudents?: () => Promise<void>;
+  studentsSyncStatus?: {
+    syncing: boolean;
+    firestoreSynced: boolean;
+    quotaExhausted: boolean;
+    totalExpress: number;
+    totalFirestore: number;
+  };
   showToast: (msg: string, type?: 'success' | 'error' | 'info') => void;
 }
 
@@ -456,6 +465,8 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
   onLoadQuestionsForTest,
   onBackToStudentPortal,
   onLockStudio,
+  onSyncAllStudents,
+  studentsSyncStatus,
   showToast,
 }) => {
   const [activeSubTab, setActiveSubTab] = useState<StudioSubTab>('analytics');
@@ -511,31 +522,54 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
     });
   };
 
-  // Unified Student List combining registered students + any student who submitted a test attempt
+  // Match an attempt to a student accurately (never collide two different students who share a name)
+  const doesAttemptMatchStudent = (att: TestAttempt, st: StudentAccount): boolean => {
+    if (!att || !st) return false;
+    if (att.studentId && st.id && att.studentId === st.id) return true;
+    const stEmail = String(st.emailOrRoll || '').trim().toLowerCase();
+    const attEmail = String(att.studentEmail || '').trim().toLowerCase();
+    if (stEmail && attEmail) {
+      return stEmail === attEmail;
+    }
+    if (!attEmail) {
+      const stName = String(st.fullName || '').trim().toLowerCase();
+      const attName = String(att.studentName || '').trim().toLowerCase();
+      if (stName && attName && stName === attName) return true;
+    }
+    return false;
+  };
+
+  // Unified Student List combining all registered students + any student who submitted a test attempt
   const unifiedStudentsWithAttempts = useMemo(() => {
     const map = new Map<string, StudentAccount>();
+    const byEmailKey = new Map<string, string>();
     for (const s of students) {
       if (!s || !s.id) continue;
-      map.set(s.id, {
-        ...s,
-        fullName: s.fullName || s.emailOrRoll || 'NEET Student',
-        emailOrRoll: s.emailOrRoll || s.id,
-      });
+      const cleanEmail = String(s.emailOrRoll || '').trim().toLowerCase();
+      const existingId = cleanEmail ? byEmailKey.get(cleanEmail) : undefined;
+      if (existingId && map.has(existingId)) {
+        const prev = map.get(existingId)!;
+        const prevTs = Number(prev.lastOnlineAt || prev.lastLoginAt || prev.createdAt || 0);
+        const nextTs = Number(s.lastOnlineAt || s.lastLoginAt || s.createdAt || 0);
+        map.set(existingId, nextTs >= prevTs ? { ...prev, ...s, id: prev.id } : { ...s, ...prev, id: prev.id });
+      } else {
+        const normalized: StudentAccount = {
+          ...s,
+          fullName: s.fullName || s.emailOrRoll || 'NEET Student',
+          emailOrRoll: s.emailOrRoll || s.id,
+        };
+        map.set(s.id, normalized);
+        if (cleanEmail) byEmailKey.set(cleanEmail, s.id);
+      }
     }
     for (const att of attempts) {
       if (!att) continue;
       const attEmail = String(att.studentEmail || '').trim().toLowerCase();
       const attName = String(att.studentName || '').trim();
       const attStuId = String(att.studentId || '').trim();
-      const alreadyMatched = Array.from(map.values()).some((st) => {
-        const stEmail = String(st.emailOrRoll || '').trim().toLowerCase();
-        const stName = String(st.fullName || '').trim().toLowerCase();
-        return (
-          (attStuId && st.id === attStuId) ||
-          (attEmail && stEmail === attEmail) ||
-          (attName && stName === attName.toLowerCase())
-        );
-      });
+      const alreadyMatched = Array.from(map.values()).some((st) =>
+        doesAttemptMatchStudent(att, st)
+      );
       if (!alreadyMatched && (attStuId || attEmail || attName)) {
         const synthId = attStuId || `att_stu_${attEmail || attName.replace(/\s+/g, '_')}`;
         map.set(synthId, {
@@ -551,9 +585,14 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
           lastLoginAt: att.completedAt || Date.now(),
           lastOnlineAt: att.completedAt || Date.now(),
         });
+        if (attEmail) byEmailKey.set(attEmail, synthId);
       }
     }
-    return Array.from(map.values());
+    return Array.from(map.values()).sort(
+      (a, b) =>
+        Number(b.lastOnlineAt || b.lastLoginAt || b.createdAt || 0) -
+        Number(a.lastOnlineAt || a.lastLoginAt || a.createdAt || 0)
+    );
   }, [students, attempts]);
 
   // Portal Logo Upload & URL State
@@ -1388,6 +1427,8 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
         totalQuestions: totalQ,
         maxMarks: totalQ * reuploadTargetTest.correctMarks,
         chapter: parsed?.metadata.chapter || reuploadTargetTest.chapter,
+        updatedAt: Date.now(),
+        hasPlayablePaper: true,
       };
       await onSaveTest(updatedMeta, resolvedQuestions, htmlText, {
         awaitServerSync: true,
@@ -2036,7 +2077,10 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
 
             <button
               type="button"
-              onClick={() => setActiveSubTab('students')}
+              onClick={() => {
+                setActiveSubTab('students');
+                if (onSyncAllStudents) void onSyncAllStudents();
+              }}
               className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs sm:text-sm font-bold transition ${
                 activeSubTab === 'students'
                   ? 'ice-glow-btn'
@@ -2044,7 +2088,7 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
               }`}
             >
               <GraduationCap className="w-4 h-4" />
-              Students ({students.length})
+              Students ({unifiedStudentsWithAttempts.length})
             </button>
 
             <button
@@ -2139,7 +2183,7 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
                 <Users className="w-4 h-4 text-indigo-600" />
               </div>
               <div className="text-3xl font-extrabold text-slate-900 font-mono-tabular mt-2">
-                {students.length}
+                {unifiedStudentsWithAttempts.length}
               </div>
               <p className="text-xs text-slate-600 mt-1">
                 Across {tests.length} published NEET CBT tests
@@ -3902,6 +3946,11 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
                             <span className="inline-flex items-center gap-1">
                               <Clock className="w-3.5 h-3.5 text-sky-600 dark:text-sky-400" /> {test.durationMinutes} min
                             </span>
+                            {!test.isBuiltIn && test.hasPlayablePaper === false && (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-rose-500/15 border border-rose-500/40 text-rose-700 dark:text-rose-300 font-extrabold">
+                                ⚠️ HTML Missing
+                              </span>
+                            )}
                           </>
                         )}
                       </div>
@@ -4049,10 +4098,25 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
                               setReuploadTargetTest(test);
                               reuploadInputRef.current?.click();
                             }}
-                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl ice-glass hover:bg-white dark:hover:bg-slate-800 text-black dark:text-white text-xs font-bold transition"
-                            title="Re-upload HTML file to refresh questions"
+                            className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-extrabold transition ${
+                              test.hasPlayablePaper === false
+                                ? 'bg-rose-600 hover:bg-rose-500 text-white shadow-sm'
+                                : 'ice-glass hover:bg-white dark:hover:bg-slate-800 text-black dark:text-white font-bold'
+                            }`}
+                            title={
+                              test.hasPlayablePaper === false
+                                ? 'Original HTML file is missing on server — click to upload exact HTML'
+                                : 'Re-upload HTML file to refresh questions'
+                            }
                           >
-                            <Upload className="w-3.5 h-3.5 text-sky-600 dark:text-sky-400" /> Sync HTML
+                            <Upload
+                              className={`w-3.5 h-3.5 ${
+                                test.hasPlayablePaper === false
+                                  ? 'text-white'
+                                  : 'text-sky-600 dark:text-sky-400'
+                              }`}
+                            />{' '}
+                            {test.hasPlayablePaper === false ? '⚠️ Re-upload HTML' : 'Sync HTML'}
                           </button>
                         )}
 
@@ -4412,25 +4476,31 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
               </p>
             </div>
 
-            {unifiedStudentsWithAttempts.length > 0 && (
-              <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              {onSyncAllStudents && (
                 <button
                   type="button"
-                  onClick={() => {
-                    const bodyText = unifiedStudentsWithAttempts
-                      .slice(0, 50)
-                      .map((st, idx) => {
-                        const stEmailLower = String(st.emailOrRoll || '').toLowerCase();
-                        const stNameLower = String(st.fullName || '').toLowerCase();
-                        const stAttempts = attempts.filter(
-                          (a) =>
-                            a &&
-                            (a.studentId === st.id ||
-                              (stEmailLower &&
-                                String(a.studentEmail || '').toLowerCase() === stEmailLower) ||
-                              (stNameLower &&
-                                String(a.studentName || '').toLowerCase() === stNameLower))
-                        );
+                  disabled={Boolean(studentsSyncStatus?.syncing)}
+                  onClick={async () => {
+                    await onSyncAllStudents();
+                    showToast('Student list synced from Server & Cloud Database!', 'info');
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white text-xs font-extrabold shadow-sm cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${studentsSyncStatus?.syncing ? 'animate-spin' : ''}`} />
+                  {studentsSyncStatus?.syncing ? 'Syncing...' : 'Sync All Students'}
+                </button>
+              )}
+
+              {unifiedStudentsWithAttempts.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const bodyText = unifiedStudentsWithAttempts
+                        .slice(0, 50)
+                        .map((st, idx) => {
+                          const stAttempts = attempts.filter((a) => doesAttemptMatchStudent(a, st));
                         const scoreLines =
                           stAttempts.length > 0
                             ? stAttempts
@@ -4524,11 +4594,38 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
                   }}
                   className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl ice-glow-btn text-xs font-bold"
                 >
-                  <Download className="w-4 h-4" /> Export Full Record (CSV)
-                </button>
-              </div>
-            )}
+                    <Download className="w-4 h-4" /> Export Full Record (CSV)
+                  </button>
+                </>
+              )}
+            </div>
           </div>
+
+          {studentsSyncStatus?.quotaExhausted && (
+            <div className="p-4 rounded-2xl bg-amber-500/15 border border-amber-500/40 text-amber-950 dark:text-amber-200 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5 text-xs sm:text-sm">
+                <AlertCircle className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-extrabold">
+                    Cloud Database Free Daily Read Quota Exhausted (Firestore Free Limit)
+                  </div>
+                  <p className="text-xs opacity-90 mt-0.5">
+                    Abhi sirf local server par saved students ({unifiedStudentsWithAttempts.length}) dikh rahe hain kyunki Firebase Firestore ka aaj ka free daily read quota khatam ho gaya hai. Kal quota reset hote hi (ya Firebase upgrade ke baad) <strong>Sync All Students</strong> dabane par saare cloud students automatically aa jayenge aur permanent backup ho jayenge.
+                  </p>
+                </div>
+              </div>
+              {onSyncAllStudents && (
+                <button
+                  type="button"
+                  disabled={studentsSyncStatus.syncing}
+                  onClick={() => void onSyncAllStudents()}
+                  className="px-3.5 py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white text-xs font-extrabold shrink-0 cursor-pointer"
+                >
+                  Retry Cloud Sync
+                </button>
+              )}
+            </div>
+          )}
 
           {/* Live Status Summary Cards */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -4539,20 +4636,14 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
                 </div>
                 <div className="text-2xl font-black font-mono-tabular text-black dark:text-white mt-1">
                   {
-                    unifiedStudentsWithAttempts.filter((st) => {
-                      const stEmailLower = String(st.emailOrRoll || '').toLowerCase();
-                      const stNameLower = String(st.fullName || '').toLowerCase();
-                      return attempts.some(
+                    unifiedStudentsWithAttempts.filter((st) =>
+                      attempts.some(
                         (a) =>
                           a &&
                           (studentTrackTestFilter === 'ALL' || a.testId === studentTrackTestFilter) &&
-                          (a.studentId === st.id ||
-                            (stEmailLower &&
-                              String(a.studentEmail || '').toLowerCase() === stEmailLower) ||
-                            (stNameLower &&
-                              String(a.studentName || '').toLowerCase() === stNameLower))
-                      );
-                    }).length
+                          doesAttemptMatchStudent(a, st)
+                      )
+                    ).length
                   }
                 </div>
               </div>
@@ -4664,18 +4755,12 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
                     const nextMap = { ...tickedStudentMap };
                     let newlyTicked = 0;
                     for (const st of unifiedStudentsWithAttempts) {
-                      const stEmailLower = String(st.emailOrRoll || '').toLowerCase();
-                      const stNameLower = String(st.fullName || '').toLowerCase();
                       const hasGiven = attempts.some(
                         (a) =>
                           a &&
                           (studentTrackTestFilter === 'ALL' ||
                             a.testId === studentTrackTestFilter) &&
-                          (a.studentId === st.id ||
-                            (stEmailLower &&
-                              String(a.studentEmail || '').toLowerCase() === stEmailLower) ||
-                            (stNameLower &&
-                              String(a.studentName || '').toLowerCase() === stNameLower))
+                          doesAttemptMatchStudent(a, st)
                       );
                       if (hasGiven) {
                         const key =
@@ -4795,11 +4880,7 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
                           a &&
                           (studentTrackTestFilter === 'ALL' ||
                             a.testId === studentTrackTestFilter) &&
-                          (a.studentId === st.id ||
-                            (stEmailLower &&
-                              String(a.studentEmail || '').toLowerCase() === stEmailLower) ||
-                            (stNameLower &&
-                              String(a.studentName || '').toLowerCase() === stNameLower))
+                          doesAttemptMatchStudent(a, st)
                       );
                       const hasCompleted = matchingAttempts.length > 0;
                       const tickKey =
@@ -4816,16 +4897,8 @@ export const MyStudioAdmin: React.FC<MyStudioAdminProps> = ({
                       return true;
                     })
                     .map((st) => {
-                      const stEmailLower = String(st.emailOrRoll || '').toLowerCase();
-                      const stNameLower = String(st.fullName || '').toLowerCase();
-                      const allStAttempts = attempts.filter(
-                        (a) =>
-                          a &&
-                          (a.studentId === st.id ||
-                            (stEmailLower &&
-                              String(a.studentEmail || '').toLowerCase() === stEmailLower) ||
-                            (stNameLower &&
-                              String(a.studentName || '').toLowerCase() === stNameLower))
+                      const allStAttempts = attempts.filter((a) =>
+                        doesAttemptMatchStudent(a, st)
                       );
                       const stAttempts =
                         studentTrackTestFilter === 'ALL'

